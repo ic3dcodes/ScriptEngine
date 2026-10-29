@@ -1,0 +1,3079 @@
+--[[
+SCRIPTENGINE // DD / v1.2.40
+Roblox LocalScript interface with feature settings, profile details, appearance controls, and session presets.
+Designed for Roblox Studio as a LocalScript under StarterPlayerScripts.
+Uses standard Roblox UI objects, TweenService, UserInputService, and RunService.
+]]
+
+local Players = game:GetService("Players")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local RunService = game:GetService("RunService")
+local Lighting = game:GetService("Lighting")
+local Teams = game:GetService("Teams")
+
+local player = Players.LocalPlayer
+if not player then return end
+local playerGui = player:WaitForChild("PlayerGui")
+
+-- Session-scoped preset storage intentionally survives a ScriptEngine UI refresh.
+-- A standard LocalScript cannot write persistent client files; persistent cross-session
+-- storage requires a server-backed profile/data store in an experience you control.
+local presetStorage = playerGui:FindFirstChild("ScriptEnginePresetStorage")
+if not presetStorage then
+    presetStorage = Instance.new("Folder")
+    presetStorage.Name = "ScriptEnginePresetStorage"
+    presetStorage.Parent = playerGui
+end
+local presetFolder = presetStorage:FindFirstChild("Presets")
+if not presetFolder then
+    presetFolder = Instance.new("Folder")
+    presetFolder.Name = "Presets"
+    presetFolder.Parent = presetStorage
+end
+local teamPresetFolder = presetStorage:FindFirstChild("TeamPresets")
+if not teamPresetFolder then
+    teamPresetFolder = Instance.new("Folder")
+    teamPresetFolder.Name = "TeamPresets"
+    teamPresetFolder.Parent = presetStorage
+end
+
+-- Clean up both the current UI and the previous release's name when updating in place.
+for _, oldName in ipairs({"ScriptEngineUI", "UnscriptedUltimate"}) do
+    local previous = playerGui:FindFirstChild(oldName)
+    if previous then previous:Destroy() end
+end
+for _, oldBlurName in ipairs({"ScriptEngineGlassBlur", "UnscriptedGlassBlur"}) do
+    local oldBlur = Lighting:FindFirstChild(oldBlurName)
+    if oldBlur and oldBlur:IsA("BlurEffect") then oldBlur:Destroy() end
+end
+
+local Theme = {
+    -- ScriptEngine's default identity is matte grayscale; colour cycling remains optional.
+    accent = Color3.fromRGB(214, 214, 214),
+    background = Color3.fromRGB(10, 10, 10),
+    panel = Color3.fromRGB(17, 17, 17),
+    card = Color3.fromRGB(25, 25, 25),
+    cardHover = Color3.fromRGB(36, 36, 36),
+    secondary = Color3.fromRGB(43, 43, 43),
+    off = Color3.fromRGB(56, 56, 56),
+    border = Color3.fromRGB(73, 73, 73),
+    text = Color3.fromRGB(244, 244, 244),
+    muted = Color3.fromRGB(157, 157, 157),
+    good = Color3.fromRGB(232, 232, 232),
+    danger = Color3.fromRGB(232, 232, 232),
+}
+
+local updateResponsiveSize
+local applyHeaderSizing
+local pageHolder
+local BUILD_NUMBER = "1.2.40"
+local BUILD_LABEL = "Powered by DevilDevs"
+local navIconUpdaters = {}
+local centerNavItem
+
+local state = {
+    page = "Overview",
+    rgb = false,
+    particles = true,
+    reduceMotion = false,
+    notifications = false,
+    minimized = false,
+    closed = false,
+    userResized = false,
+    resizing = false,
+    sliderDragging = false,
+    activeSlider = nil,
+    glass = false,
+    navProgrammatic = false,
+    deckProgrammatic = false,
+    hue = 0.72,
+    particleCount = 0,
+}
+local values = {}
+local uiSessionStart = os.clock()
+local accentBindings = {}
+local pages = {}
+local navButtons = {}
+local rgbToggleData = nil
+local valueControls = {}
+
+
+local function create(className, props, parent)
+    local instance = Instance.new(className)
+    for key, value in pairs(props or {}) do instance[key] = value end
+    instance.Parent = parent
+    return instance
+end
+
+local function corner(parent, radius)
+    return create("UICorner", {CornerRadius = UDim.new(0, radius or 10)}, parent)
+end
+
+local function stroke(parent, color, thickness, transparency)
+    return create("UIStroke", {
+        Color = color or Theme.border,
+        Thickness = thickness or 1,
+        Transparency = transparency == nil and 0.18 or transparency,
+        ApplyStrokeMode = Enum.ApplyStrokeMode.Border,
+    }, parent)
+end
+
+local function padding(parent, left, right, top, bottom)
+    return create("UIPadding", {
+        PaddingLeft = UDim.new(0, left or 0),
+        PaddingRight = UDim.new(0, right or 0),
+        PaddingTop = UDim.new(0, top or 0),
+        PaddingBottom = UDim.new(0, bottom or 0),
+    }, parent)
+end
+
+local function animate(object, duration, properties, style, direction)
+    if not object or not object.Parent then return nil end
+    duration = duration or 0.16
+    local animationProfile = values and values.AnimationProfile
+    if animationProfile == "Snappy" then
+        duration = duration * 0.72
+    elseif animationProfile == "Soft" then
+        duration = duration * 1.22
+    elseif animationProfile == "Minimal" then
+        duration = duration * 0.52
+    end
+    local info = TweenInfo.new(
+        duration,
+        style or Enum.EasingStyle.Quint,
+        direction or Enum.EasingDirection.Out
+    )
+    local tw = TweenService:Create(object, info, properties)
+    tw:Play()
+    return tw
+end
+
+local function setPage(name, centerSelection)
+    if not pages[name] then return end
+    state.page = name
+    for _, page in pairs(pages) do
+        page.Visible = true
+    end
+    for pageName, button in pairs(navButtons) do
+        local active = pageName == name
+        animate(button, state.reduceMotion and 0.04 or 0.16, {
+            BackgroundColor3 = active and Theme.secondary or Theme.card,
+            TextColor3 = active and Theme.text or Theme.muted,
+        })
+        local edge = button:FindFirstChildOfClass("UIStroke")
+        if edge then animate(edge, state.reduceMotion and 0.04 or 0.16, {Color = active and Theme.text or Theme.border}) end
+        local navLabel = button:FindFirstChild("SectionName")
+        if navLabel then animate(navLabel, state.reduceMotion and 0.04 or 0.16, {TextColor3 = active and Theme.text or Theme.muted}) end
+        if navIconUpdaters[pageName] then navIconUpdaters[pageName](active and Theme.text or Theme.muted) end
+        local marker = button:FindFirstChild("ActiveMarker")
+        if marker then animate(marker, state.reduceMotion and 0.04 or 0.16, {BackgroundTransparency = active and 0 or 1}) end
+    end
+    local activePage = pages[name]
+    if centerSelection ~= false and activePage and pageHolder then
+        task.defer(function()
+            if not activePage.Parent or not pageHolder.Parent then return end
+            local localX = activePage.AbsolutePosition.X - pageHolder.AbsolutePosition.X + pageHolder.CanvasPosition.X
+            local targetX = localX
+            if pageHolder.AbsoluteSize.X > activePage.AbsoluteSize.X + 12 then
+                targetX = localX - (pageHolder.AbsoluteSize.X - activePage.AbsoluteSize.X) / 2
+            end
+            local maxX = math.max(0, pageHolder.AbsoluteCanvasSize.X - pageHolder.AbsoluteSize.X)
+            targetX = math.clamp(targetX, 0, maxX)
+            state.deckProgrammatic = true
+            local tween = animate(pageHolder, state.reduceMotion and 0.04 or 0.22,
+                {CanvasPosition = Vector2.new(targetX, 0)}, Enum.EasingStyle.Quint)
+            if tween then
+                tween.Completed:Connect(function() task.delay(0.08, function() state.deckProgrammatic = false end) end)
+            else
+                pageHolder.CanvasPosition = Vector2.new(targetX, 0)
+                task.delay(0.08, function() state.deckProgrammatic = false end)
+            end
+        end)
+    end
+    if centerSelection ~= false and centerNavItem then centerNavItem(name) end
+end
+
+local function bindAccent(callback)
+    table.insert(accentBindings, callback)
+    callback(Theme.accent)
+end
+
+local function applyAccent(color)
+    Theme.accent = color
+    for i = #accentBindings, 1, -1 do
+        local ok, keep = pcall(accentBindings[i], color)
+        if not ok or keep == false then table.remove(accentBindings, i) end
+    end
+end
+
+
+-- Shared DD insignia: layered glyphs and angular shield.
+-- Constructed from native UI primitives so it scales cleanly with the title and orb.
+local function makeDDMark(parent, pixelSize, zIndex, contrastOnAccentSurface)
+    local mark = create("Frame", {
+        Name = "DDMark", Size = UDim2.fromScale(1, 1),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = zIndex,
+    }, parent)
+    local scale = math.max(0.55, pixelSize / 42)
+    local shield = create("Frame", {
+        Name = "DDShield", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(0.72, 0, 0.72, 0),
+        Rotation = 45, BackgroundTransparency = 1, BorderSizePixel = 0,
+        ZIndex = zIndex + 1,
+    }, mark)
+    corner(shield, math.max(2, math.floor(4 * scale)))
+    local shieldStroke = stroke(shield, Theme.accent, math.max(1, 1.35 * scale), 0.12)
+    local leftD = create("TextLabel", {
+        Name = "DDLeftGlyph", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.39, 0, 0.52, 0), Size = UDim2.new(0.65, 0, 0.78, 0),
+        BackgroundTransparency = 1, Text = "D", TextColor3 = Color3.fromRGB(16, 16, 16),
+        Font = Enum.Font.GothamBlack, TextSize = math.max(10, math.floor(pixelSize * 0.69)),
+        Rotation = -7, TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center, TextStrokeTransparency = 0.82,
+        ZIndex = zIndex + 3,
+    }, mark)
+    local rightD = create("TextLabel", {
+        Name = "DDRightGlyph", AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.64, 0, 0.48, 0), Size = UDim2.new(0.65, 0, 0.78, 0),
+        BackgroundTransparency = 1, Text = "D", TextColor3 = Theme.accent,
+        Font = Enum.Font.GothamBlack, TextSize = math.max(10, math.floor(pixelSize * 0.69)),
+        Rotation = 7, TextXAlignment = Enum.TextXAlignment.Center,
+        TextYAlignment = Enum.TextYAlignment.Center, TextStrokeTransparency = 0.8,
+        ZIndex = zIndex + 4,
+    }, mark)
+    bindAccent(function(color)
+        if not mark.Parent then return false end
+        local luminance = color.R * 0.299 + color.G * 0.587 + color.B * 0.114
+        local contrast = (contrastOnAccentSurface and luminance < 0.53)
+            and Color3.fromRGB(248, 248, 248) or Color3.fromRGB(16, 16, 16)
+        leftD.TextColor3 = contrast
+        rightD.TextColor3 = contrastOnAccentSurface and contrast or color
+        shieldStroke.Color = contrastOnAccentSurface and contrast or color
+        return true
+    end)
+    return {root = mark, left = leftD, right = rightD}
+end
+
+-- Glassmorphism layer: translucent/tinted UI surfaces plus an optional world blur.
+-- Roblox's native BlurEffect affects the 3D scene behind ScreenGui content, not the
+-- ScreenGui panel itself; the glass surfaces are therefore simulated with transparency,
+-- a faint accent tint, a highlight gradient, and border strokes.
+local glassTargets = {}
+local glassBlurEffect = nil
+local function registerGlassSurface(object, radius, addTintOverlay)
+    if not object or not object:IsA("GuiObject") then return object end
+    local entry = {
+        object = object,
+        baseTransparency = object.BackgroundTransparency,
+        overlay = nil,
+        baseRadius = radius or 10,
+    }
+    if addTintOverlay ~= false then
+        local overlay = create("Frame", {
+            Name = "GlassTintOverlay",
+            Size = UDim2.fromScale(1, 1),
+            Position = UDim2.fromScale(0, 0),
+            BackgroundColor3 = Theme.accent,
+            BackgroundTransparency = 1,
+            BorderSizePixel = 0,
+            Active = false,
+            Selectable = false,
+            Visible = false,
+            ZIndex = object.ZIndex + 1,
+        }, object)
+        corner(overlay, entry.baseRadius)
+        local sheen = create("UIGradient", {
+            Rotation = 115,
+            Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(0.42, Theme.accent),
+                ColorSequenceKeypoint.new(1, Theme.accent),
+            }),
+            Transparency = NumberSequence.new({
+                NumberSequenceKeypoint.new(0, 0.56),
+                NumberSequenceKeypoint.new(0.48, 0.86),
+                NumberSequenceKeypoint.new(1, 0.97),
+            }),
+        }, overlay)
+        entry.overlay = overlay
+        entry.sheen = sheen
+        bindAccent(function(color)
+            if not overlay.Parent then return false end
+            overlay.BackgroundColor3 = color
+            sheen.Color = ColorSequence.new({
+                ColorSequenceKeypoint.new(0, Color3.new(1, 1, 1)),
+                ColorSequenceKeypoint.new(0.42, color),
+                ColorSequenceKeypoint.new(1, color),
+            })
+            return true
+        end)
+    end
+    table.insert(glassTargets, entry)
+    if state.glass then
+        local currentStrength = math.clamp(tonumber(values.GlassBlur) or 42, 0, 100)
+        local clarityOffset = ((100 - currentStrength) / 100) * 0.20
+        object.BackgroundTransparency = math.clamp(entry.baseTransparency + 0.12 + clarityOffset, 0, 0.88)
+        if entry.overlay then
+            entry.overlay.Visible = true
+            entry.overlay.BackgroundTransparency = 0.92 - currentStrength * 0.0014
+        end
+    end
+    return object
+end
+
+local function applyGlass(enabled, strength)
+    state.glass = enabled == true
+    strength = math.clamp(tonumber(strength) or values.GlassBlur or 42, 0, 100)
+    for i = #glassTargets, 1, -1 do
+        local entry = glassTargets[i]
+        local object = entry.object
+        if not object or not object.Parent then
+            table.remove(glassTargets, i)
+        else
+            if state.glass then
+                -- At low strength surfaces are clearer; at high strength they read as frosted glass.
+                local clarityOffset = ((100 - strength) / 100) * 0.20
+                object.BackgroundTransparency = math.clamp(entry.baseTransparency + 0.12 + clarityOffset, 0, 0.88)
+                if entry.overlay and entry.overlay.Parent then
+                    entry.overlay.Visible = true
+                    entry.overlay.BackgroundTransparency = 0.92 - strength * 0.0014
+                end
+            else
+                object.BackgroundTransparency = entry.baseTransparency
+                if entry.overlay and entry.overlay.Parent then
+                    entry.overlay.Visible = false
+                    entry.overlay.BackgroundTransparency = 1
+                end
+            end
+        end
+    end
+
+    if state.glass and strength > 0 then
+        if not glassBlurEffect or not glassBlurEffect.Parent then
+            glassBlurEffect = create("BlurEffect", {
+                Name = "ScriptEngineGlassBlur",
+                Size = 0,
+                Enabled = true,
+            }, Lighting)
+        end
+        glassBlurEffect.Enabled = true
+        glassBlurEffect.Size = math.floor((strength / 100) * 24 + 0.5)
+    elseif glassBlurEffect then
+        glassBlurEffect:Destroy()
+        glassBlurEffect = nil
+    end
+end
+
+local gui = create("ScreenGui", {
+    Name = "ScriptEngineUI",
+    ResetOnSpawn = false,
+    IgnoreGuiInset = false,
+    DisplayOrder = 999,
+    ZIndexBehavior = Enum.ZIndexBehavior.Sibling,
+}, playerGui)
+
+-- Responsive window: large enough to read, but constrained to the current viewport.
+local camera = workspace.CurrentCamera
+local main = create("Frame", {
+    Name = "MainWindow",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(660, 480),
+    BackgroundColor3 = Theme.background,
+    BorderSizePixel = 0,
+    ClipsDescendants = false,
+    ZIndex = 2,
+}, gui)
+corner(main, 17)
+registerGlassSurface(main, 17)
+local mainConstraint = create("UISizeConstraint", {
+    MinSize = Vector2.new(160, 160),
+    MaxSize = Vector2.new(860, 600),
+}, main)
+local shadow = create("Frame", {
+    Name = "DepthShadow",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 7),
+    Size = UDim2.new(1, 10, 1, 10),
+    BackgroundColor3 = Color3.fromRGB(3, 3, 3),
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    ZIndex = 1,
+}, main)
+corner(shadow, 20)
+
+local mainGradient = create("UIGradient", {
+    Rotation = 25,
+    Color = ColorSequence.new({
+        ColorSequenceKeypoint.new(0, Color3.fromRGB(29, 29, 29)),
+        ColorSequenceKeypoint.new(0.55, Theme.background),
+        ColorSequenceKeypoint.new(1, Color3.fromRGB(14, 14, 14)),
+    }),
+}, main)
+
+local header = create("CanvasGroup", {
+    Name = "Header",
+    Position = UDim2.fromOffset(1, 5),
+    Size = UDim2.new(1, -2, 0, 52),
+    BackgroundColor3 = Theme.panel,
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    Active = true,
+    ClipsDescendants = true,
+    GroupTransparency = 0,
+    ZIndex = 3,
+}, main)
+corner(header, 16)
+registerGlassSurface(header, 16)
+
+-- Animated emblem with faux depth / orbital ring.
+local emblem = create("Frame", {
+    Name = "Emblem",
+    Position = UDim2.fromOffset(13, 10),
+    Size = UDim2.fromOffset(34, 34),
+    BackgroundColor3 = Theme.text,
+    BorderSizePixel = 0,
+    ZIndex = 5,
+}, header)
+corner(emblem, 100)
+bindAccent(function(color)
+    if not emblem.Parent then return false end
+    emblem.BackgroundColor3 = color
+    return true
+end)
+local emblemGradient = create("UIGradient", {
+    Rotation = 35,
+    Color = ColorSequence.new(Color3.new(1, 1, 1), Color3.fromRGB(222, 222, 222)),
+}, emblem)
+bindAccent(function(color)
+    if not emblemGradient.Parent then return false end
+    emblemGradient.Color = ColorSequence.new(Color3.new(1, 1, 1), color)
+    return true
+end)
+local orbit = create("Frame", {
+    Name = "OrbitRing",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.5, 0, 0.5, 0),
+    Size = UDim2.new(1, 9, 1, 9),
+    BackgroundTransparency = 1,
+    ZIndex = 4,
+}, emblem)
+corner(orbit, 100)
+local orbitStroke = stroke(orbit, Theme.accent, 1.2, 0.15)
+bindAccent(function(color) if orbitStroke.Parent then orbitStroke.Color = color end end)
+local emblemMark = makeDDMark(emblem, 34, 6, true)
+local emblemMarkScale = create("UIScale", {Scale = 1}, emblemMark.root)
+
+local brandTitle = create("TextLabel", {
+    Name = "BrandTitle",
+    Position = UDim2.fromOffset(57, 8),
+    Size = UDim2.new(1, -205, 0, 22),
+    BackgroundTransparency = 1,
+    Text = "ScriptEngine",
+    TextColor3 = Theme.text,
+    Font = Enum.Font.GothamBlack,
+    TextSize = 16,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 5,
+}, header)
+local brandSubtitle = create("TextLabel", {
+    Name = "BrandSubtitle",
+    Position = UDim2.fromOffset(58, 30),
+    Size = UDim2.new(1, -205, 0, 13),
+    BackgroundTransparency = 1,
+    Text = BUILD_LABEL,
+    TextColor3 = Theme.muted,
+    Font = Enum.Font.Code,
+    TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd,
+    ZIndex = 5,
+}, header)
+
+local function headerButton(name, symbol, rightOffset, tint)
+    local b = create("TextButton", {
+        Name = name,
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, rightOffset, 0.5, 0),
+        Size = UDim2.fromOffset(29, 29),
+        BackgroundColor3 = Theme.card,
+        Text = symbol,
+        TextColor3 = tint or Theme.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 17,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, header)
+    corner(b, 9)
+    registerGlassSurface(b, 9)
+    local scale = create("UIScale", {Scale = 1}, b)
+    b.MouseEnter:Connect(function()
+        if values.HoverEffects ~= false then
+            animate(b, 0.12, {BackgroundColor3 = Theme.cardHover})
+            if not state.reduceMotion then animate(scale, 0.12, {Scale = 1.08}) end
+        end
+    end)
+    b.MouseLeave:Connect(function()
+        animate(b, 0.12, {BackgroundColor3 = Theme.card})
+        animate(scale, 0.12, {Scale = 1})
+    end)
+    return b
+end
+local closeButton = headerButton("Close", "×", -9, Theme.text)
+local minimizeButton = headerButton("Minimize", "–", -45, Theme.text)
+local resizeButton = headerButton("Resize", "", -81, Theme.text)
+-- Three-line diagonal resize grip; each line follows the shared RGB accent cycle.
+local resizeGripLines = {}
+for i = 1, 3 do
+    local line = create("Frame", {
+        Name = "ResizeGripLine" .. tostring(i),
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(0.5, (i - 2) * 4, 0.5, (i - 2) * 4),
+        Size = UDim2.fromOffset(12 - (i - 1) * 2, 2),
+        Rotation = -45,
+        BackgroundColor3 = Theme.accent,
+        BorderSizePixel = 0,
+        ZIndex = 8,
+    }, resizeButton)
+    corner(line, 2)
+    resizeGripLines[i] = line
+end
+bindAccent(function(color)
+    for _, line in ipairs(resizeGripLines) do
+        if line.Parent then line.BackgroundColor3 = color end
+    end
+    return true
+end)
+
+local orb = create("TextButton", {
+    Name = "MinimizedOrb",
+    AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.new(0.86, 0, 0.78, 0),
+    Size = UDim2.fromOffset(28, 28),
+    BackgroundColor3 = Theme.accent,
+    Text = "",
+    TextColor3 = Color3.fromRGB(14, 14, 14),
+    Font = Enum.Font.GothamBlack,
+    TextSize = 9,
+    Visible = false,
+    AutoButtonColor = false,
+    BorderSizePixel = 0,
+    Active = true,
+    ZIndex = 20,
+}, gui)
+corner(orb, 100)
+bindAccent(function(color)
+    if not orb.Parent then return false end
+    orb.BackgroundColor3 = color
+    return true
+end)
+local orbStroke = stroke(orb, Theme.accent, 2, 0.05)
+bindAccent(function(color)
+    if not orbStroke.Parent then return false end
+    orbStroke.Color = color
+    return true
+end)
+local orbGradient = create("UIGradient", {
+    Rotation = 40,
+    Color = ColorSequence.new(Theme.accent:Lerp(Color3.new(1, 1, 1), 0.24), Theme.accent:Lerp(Color3.new(0, 0, 0), 0.22)),
+}, orb)
+bindAccent(function(color)
+    if not orbGradient.Parent then return false end
+    orbGradient.Color = ColorSequence.new(color:Lerp(Color3.new(1, 1, 1), 0.24), color:Lerp(Color3.new(0, 0, 0), 0.22))
+    return true
+end)
+local orbOrbit = create("Frame", {
+    Name = "LogoOrbit", AnchorPoint = Vector2.new(0.5, 0.5),
+    Position = UDim2.fromScale(0.5, 0.5), Size = UDim2.new(1, 5, 1, 5),
+    BackgroundTransparency = 1, ZIndex = 21,
+}, orb)
+corner(orbOrbit, 100)
+local orbOrbitStroke = stroke(orbOrbit, Theme.accent, 1.2, 0.18)
+bindAccent(function(color)
+    if not orbOrbitStroke.Parent then return false end
+    orbOrbitStroke.Color = color
+    return true
+end)
+local orbMark = makeDDMark(orb, 28, 22, true)
+local orbMarkScale = create("UIScale", {Scale = 1}, orbMark.root)
+local orbScale = create("UIScale", {Scale = 1}, orb)
+
+local body = create("Frame", {
+    Name = "Body",
+    Position = UDim2.new(0, 10, 0, 67),
+    Size = UDim2.new(1, -20, 1, -63),
+    BackgroundTransparency = 1,
+    ZIndex = 3,
+}, main)
+-- A user-adjustable content scale keeps controls readable without changing window bounds.
+local bodyScale = create("UIScale", {Scale = 0.97}, body)
+
+local sidebarPanel = create("Frame", {
+    Name = "ModuleDock",
+    Position = UDim2.new(0, 0, 0, 0),
+    Size = UDim2.new(1, 0, 0, 42),
+    BackgroundColor3 = Theme.panel,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 3,
+}, body)
+corner(sidebarPanel, 10)
+registerGlassSurface(sidebarPanel, 10)
+stroke(sidebarPanel, Theme.border, 1, 0.42)
+
+local sidebarDivider = create("Frame", {
+    Name = "DockDivider",
+    Position = UDim2.new(0, 10, 1, -1),
+    Size = UDim2.new(1, -20, 0, 1),
+    BackgroundColor3 = Theme.border,
+    BackgroundTransparency = 0.34,
+    BorderSizePixel = 0,
+    ZIndex = 4,
+}, sidebarPanel)
+bindAccent(function() if sidebarDivider.Parent then sidebarDivider.BackgroundColor3 = Theme.border; return true end return false end)
+local sidebar = create("ScrollingFrame", {
+    Name = "CategoryDock",
+    Position = UDim2.new(0, 4, 0, 3),
+    Size = UDim2.new(1, -8, 1, -6),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ScrollingDirection = Enum.ScrollingDirection.X,
+    ScrollingEnabled = true,
+    ElasticBehavior = Enum.ElasticBehavior.Always,
+    ScrollBarThickness = 0,
+    ClipsDescendants = true,
+    Active = true,
+    ZIndex = 4,
+}, sidebarPanel)
+local navLayout = create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 6),
+    VerticalAlignment = Enum.VerticalAlignment.Center,
+    HorizontalAlignment = Enum.HorizontalAlignment.Left,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, sidebar)
+padding(sidebar, 2, 2, 0, 0)
+local function refreshNavCanvas()
+    sidebar.CanvasSize = UDim2.new(0, navLayout.AbsoluteContentSize.X + 8, 0, 0)
+end
+navLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(refreshNavCanvas)
+refreshNavCanvas()
+
+-- Local profile card: uses Roblox-exposed player metadata and the standard headshot thumbnail API.
+-- The session timer measures elapsed time since this interface was launched.
+local profileCard = create("Frame", {
+    Name = "LocalProfileCard",
+    Position = UDim2.new(0, 0, 0, 102),
+    Size = UDim2.new(1, 0, 0, 126),
+    BackgroundColor3 = Theme.card,
+    BorderSizePixel = 0,
+    ClipsDescendants = true,
+    ZIndex = 4,
+}, body)
+corner(profileCard, 11)
+registerGlassSurface(profileCard, 11)
+local profileStroke = stroke(profileCard, Theme.border, 1, 0.36)
+bindAccent(function(color) if profileStroke.Parent then profileStroke.Color = color; return true end return false end)
+local profileHeading = create("TextLabel", {
+    Name = "ProfileHeading",
+    Position = UDim2.fromOffset(8, 7), Size = UDim2.new(1, -16, 0, 13),
+    BackgroundTransparency = 1, Text = "PLAYER PROFILE",
+    TextColor3 = Theme.muted, Font = Enum.Font.GothamBold, TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileCard)
+local profileAvatar = create("ImageLabel", {
+    Name = "ProfileAvatar",
+    Position = UDim2.fromOffset(8, 25), Size = UDim2.fromOffset(32, 32),
+    BackgroundColor3 = Theme.secondary, BackgroundTransparency = 0,
+    Image = "", ScaleType = Enum.ScaleType.Crop, BorderSizePixel = 0, ZIndex = 6,
+}, profileCard)
+corner(profileAvatar, 9)
+local profileAvatarStroke = stroke(profileAvatar, Theme.accent, 1, 0.22)
+bindAccent(function(color) if profileAvatarStroke.Parent then profileAvatarStroke.Color = color; return true end return false end)
+local profileDisplayName = create("TextLabel", {
+    Name = "ProfileDisplayName",
+    Position = UDim2.new(0, 46, 0, 25), Size = UDim2.new(1, -52, 0, 16),
+    BackgroundTransparency = 1, Text = player.DisplayName,
+    TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileCard)
+local profileUsername = create("TextLabel", {
+    Name = "ProfileUsername",
+    Position = UDim2.new(0, 46, 0, 42), Size = UDim2.new(1, -52, 0, 12),
+    BackgroundTransparency = 1, Text = "@" .. player.Name,
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham, TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileCard)
+local profileDivider = create("Frame", {
+    Name = "ProfileDivider", Position = UDim2.new(0, 8, 0, 64),
+    Size = UDim2.new(1, -16, 0, 1), BackgroundColor3 = Theme.border,
+    BackgroundTransparency = 0.25, BorderSizePixel = 0, ZIndex = 6,
+}, profileCard)
+bindAccent(function(color) if profileDivider.Parent then profileDivider.BackgroundColor3 = color; return true end return false end)
+local profileDetails = create("ScrollingFrame", {
+    Name = "ProfileDetails",
+    Position = UDim2.new(0, 6, 0, 70), Size = UDim2.new(1, -12, 0, 50),
+    BackgroundTransparency = 1, BorderSizePixel = 0,
+    ScrollBarThickness = 2, ScrollBarImageColor3 = Theme.accent,
+    CanvasSize = UDim2.new(0, 0, 0, 58), AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ScrollingDirection = Enum.ScrollingDirection.Y, ClipsDescendants = true,
+    Active = true, ZIndex = 5,
+}, profileCard)
+bindAccent(function(color) if profileDetails.Parent then profileDetails.ScrollBarImageColor3 = color; return true end return false end)
+local profileAge = create("TextLabel", {
+    Name = "ProfileAccountAge", Position = UDim2.fromOffset(2, 0), Size = UDim2.new(1, -6, 0, 13),
+    BackgroundTransparency = 1, Text = "Account: " .. tostring(player.AccountAge) .. " days",
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham, TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileDetails)
+local profileGame = create("TextLabel", {
+    Name = "ProfileGame", Position = UDim2.fromOffset(2, 14), Size = UDim2.new(1, -6, 0, 13),
+    BackgroundTransparency = 1, Text = "Game: Place " .. tostring(game.PlaceId),
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham, TextSize = 8,
+    TextWrapped = false, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Center,
+    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileDetails)
+local profileRole
+local function refreshProfileRole()
+    profileUsername.Text = "@" .. player.Name
+    profileDisplayName.Text = player.DisplayName
+    profileAge.Text = "Account: " .. tostring(player.AccountAge) .. " days"
+    if profileRole and profileRole.Parent then
+        profileRole.Text = "Role: " .. (player.Team and player.Team.Name or "Player")
+    end
+end
+profileRole = create("TextLabel", {
+    Name = "ProfileRole", Position = UDim2.fromOffset(2, 28), Size = UDim2.new(1, -6, 0, 13),
+    BackgroundTransparency = 1, Text = "Role: " .. (player.Team and player.Team.Name or "Player"),
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham, TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileDetails)
+local profileSession = create("TextLabel", {
+    Name = "ProfileSession", Position = UDim2.fromOffset(2, 42), Size = UDim2.new(1, -6, 0, 13),
+    BackgroundTransparency = 1, Text = "UI session: 0m",
+    TextColor3 = Theme.muted, Font = Enum.Font.Gotham, TextSize = 8,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 6,
+}, profileDetails)
+player:GetPropertyChangedSignal("Team"):Connect(refreshProfileRole)
+player:GetPropertyChangedSignal("DisplayName"):Connect(refreshProfileRole)
+task.spawn(function()
+    for attempt = 1, 5 do
+        local ok, imageUrl, isReady = pcall(function()
+            return Players:GetUserThumbnailAsync(player.UserId, Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+        end)
+        if ok and imageUrl and profileAvatar.Parent then
+            profileAvatar.Image = imageUrl
+            if isReady then break end
+        end
+        task.wait(0.45)
+    end
+end)
+task.spawn(function()
+    local ok, MarketplaceService = pcall(function() return game:GetService("MarketplaceService") end)
+    if ok and MarketplaceService then
+        local success, info = pcall(function() return MarketplaceService:GetProductInfo(game.PlaceId) end)
+        if success and info and info.Name and profileGame.Parent then profileGame.Text = "Game: " .. info.Name end
+    end
+end)
+task.spawn(function()
+    while gui.Parent and profileSession.Parent do
+        local elapsed = math.max(0, math.floor(os.clock() - uiSessionStart))
+        local hours = math.floor(elapsed / 3600)
+        local minutes = math.floor((elapsed % 3600) / 60)
+        local labelText = hours > 0 and (tostring(hours) .. "h " .. tostring(minutes) .. "m") or (tostring(minutes) .. "m")
+        profileSession.Text = "UI session: " .. labelText
+        task.wait(5)
+    end
+end)
+
+pageHolder = create("ScrollingFrame", {
+    Name = "ModuleDeck",
+    Position = UDim2.new(0, 0, 0, 49),
+    Size = UDim2.new(1, 0, 1, -49),
+    BackgroundTransparency = 1,
+    BorderSizePixel = 0,
+    CanvasPosition = Vector2.zero,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.None,
+    ScrollingDirection = Enum.ScrollingDirection.X,
+    ScrollingEnabled = true,
+    ElasticBehavior = Enum.ElasticBehavior.Always,
+    ScrollBarThickness = 0,
+    ClipsDescendants = true,
+    Active = true,
+    ZIndex = 3,
+}, body)
+local deckLayout = create("UIListLayout", {
+    FillDirection = Enum.FillDirection.Horizontal,
+    Padding = UDim.new(0, 8),
+    HorizontalAlignment = Enum.HorizontalAlignment.Left,
+    VerticalAlignment = Enum.VerticalAlignment.Top,
+    SortOrder = Enum.SortOrder.LayoutOrder,
+}, pageHolder)
+local function refreshDeckCanvas()
+    if pageHolder and pageHolder.Parent then
+        pageHolder.CanvasSize = UDim2.new(0, deckLayout.AbsoluteContentSize.X + 8, 0, 0)
+    end
+end
+deckLayout:GetPropertyChangedSignal("AbsoluteContentSize"):Connect(refreshDeckCanvas)
+refreshDeckCanvas()
+
+local toastLayer = create("Frame", {
+    Name = "ToastLayer",
+    Size = UDim2.fromScale(1, 1),
+    BackgroundTransparency = 1,
+    ClipsDescendants = false,
+    ZIndex = 100,
+}, main)
+
+local function toast(message, force)
+    if (not state.notifications and not force) or state.closed then return end
+    local box = create("Frame", {
+        AnchorPoint = Vector2.new(1, 0),
+        Position = UDim2.new(1, -12, 0, 64),
+        Size = UDim2.new(0, 220, 0, 37),
+        BackgroundColor3 = Theme.card,
+        BackgroundTransparency = 0.06,
+        BorderSizePixel = 0,
+        ZIndex = 110,
+    }, toastLayer)
+    corner(box, 10)
+    registerGlassSurface(box, 10)
+    local edge = stroke(box, Theme.accent, 1, 0.05)
+    bindAccent(function(color)
+        if not edge.Parent then return false end
+        edge.Color = color
+    end)
+    local label = create("TextLabel", {
+        Position = UDim2.fromOffset(11, 0),
+        Size = UDim2.new(1, -22, 1, 0),
+        BackgroundTransparency = 1,
+        Text = message,
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        TextTransparency = 1,
+        ZIndex = 111,
+    }, box)
+    local from = box.Position
+    box.Position = from + UDim2.fromOffset(0, -8)
+    animate(box, 0.2, {Position = from})
+    animate(label, 0.2, {TextTransparency = 0})
+    -- Toast lifetime is one second total: 0.80s visible, then a 0.16s fade and cleanup.
+    task.delay(0.80, function()
+        if box.Parent then
+            animate(box, 0.16, {Position = from + UDim2.fromOffset(0, -6), BackgroundTransparency = 1})
+            animate(label, 0.13, {TextTransparency = 1})
+            task.delay(0.20, function() if box.Parent then box:Destroy() end end)
+        end
+    end)
+end
+
+local function particleBurst(absolutePosition, color)
+    if not state.particles or state.reduceMotion or not toastLayer.Parent then return end
+    if state.particleCount > 85 then return end
+    local center = absolutePosition - toastLayer.AbsolutePosition
+    local particleCount = 8
+    for i = 1, particleCount do
+        state.particleCount += 1
+        local size = math.random(3, 5)
+        local dot = create("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5),
+            Position = UDim2.fromOffset(center.X, center.Y),
+            Size = UDim2.fromOffset(size, size),
+            BackgroundColor3 = color or Theme.accent,
+            BackgroundTransparency = 0,
+            BorderSizePixel = 0,
+            ZIndex = 105,
+        }, toastLayer)
+        corner(dot, 100)
+        local angle = math.rad((360 / particleCount) * i + math.random(-22, 22))
+        local burstDistance = math.random(12, 24)
+        local burstX = center.X + math.cos(angle) * burstDistance
+        local burstY = center.Y + math.sin(angle) * burstDistance - math.random(3, 10)
+        local fallX = burstX + math.random(-8, 8)
+        local fallY = burstY + math.random(22, 42)
+        animate(dot, 0.16, {
+            Position = UDim2.fromOffset(burstX, burstY),
+            Size = UDim2.fromOffset(math.max(2, size - 1), math.max(2, size - 1)),
+        }, Enum.EasingStyle.Quad, Enum.EasingDirection.Out)
+        task.delay(0.16, function()
+            if dot.Parent then
+                animate(dot, 0.84, {
+                    Position = UDim2.fromOffset(fallX, fallY),
+                    Size = UDim2.fromOffset(0, 0),
+                    BackgroundTransparency = 1,
+                }, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+            end
+        end)
+        task.delay(1.02, function()
+            if dot.Parent then dot:Destroy() end
+            state.particleCount = math.max(0, state.particleCount - 1)
+        end)
+    end
+end
+
+-- Draw simple crisp line icons from native UI shapes; no external image atlas or missing glyphs.
+local function makeNavIcon(parent, kind)
+    local parts = {}
+    local canvas = create("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5), Position = UDim2.new(0, 4, 0.5, 0),
+        Size = UDim2.fromOffset(22, 22), BackgroundTransparency = 1, ZIndex = 7,
+    }, parent)
+    local function part(x, y, w, h, radius, rotation, filled)
+        local f = create("Frame", {
+            Position = UDim2.fromOffset(x, y), Size = UDim2.fromOffset(w, h),
+            BackgroundColor3 = Theme.muted, BackgroundTransparency = filled == false and 1 or 0,
+            BorderSizePixel = 0, Rotation = rotation or 0, ZIndex = 7,
+        }, canvas)
+        if radius then corner(f, radius) end
+        if filled == false then
+            local st = stroke(f, Theme.muted, 1.5, 0)
+            table.insert(parts, st)
+        else
+            table.insert(parts, f)
+        end
+        return f
+    end
+    if kind == "overview" then
+        part(5, 5, 7, 7, 2); part(14, 5, 7, 7, 2); part(5, 14, 7, 7, 2); part(14, 14, 7, 7, 2)
+    elseif kind == "target" then
+        local ring = part(4, 4, 17, 17, 20, 0, false)
+        part(11, 1, 2, 5, 1); part(11, 19, 2, 5, 1); part(1, 11, 5, 2, 1); part(19, 11, 5, 2, 1)
+        part(10, 10, 5, 5, 5)
+    elseif kind == "visuals" then
+        part(3, 7, 19, 11, 8, 0, false)
+        part(10, 10, 5, 5, 5)
+        part(11, 11, 3, 3, 3)
+    elseif kind == "movement" then
+        -- Smooth pedestrian glyph: rounded head, continuous torso/limbs, soft silhouette.
+        part(9, 1, 6, 6, 6)
+        part(9, 7, 6, 8, 3)
+        part(5, 8, 5, 3, 2, -24)
+        part(14, 8, 5, 3, 2, 24)
+        part(8, 13, 4, 8, 2, 7)
+        part(12, 13, 4, 8, 2, -7)
+    elseif kind == "plugins" then
+        -- Clean connected-node mark for presets/plugins.
+        part(3, 3, 6, 6, 3, 0, false)
+        part(15, 3, 6, 6, 3, 0, false)
+        part(9, 14, 6, 6, 3, 0, false)
+        part(7, 7, 8, 2, 1, 0, true)
+        part(10, 9, 2, 6, 1, 0, true)
+    elseif kind == "players" then
+        part(5, 4, 7, 7, 7); part(14, 6, 6, 6, 6)
+        part(2, 13, 13, 8, 5); part(13, 14, 9, 7, 4)
+    elseif kind == "interface" then
+        part(3, 5, 19, 2, 1); part(3, 11, 19, 2, 1); part(3, 17, 19, 2, 1)
+        part(7, 2, 4, 8, 2); part(14, 8, 4, 8, 2); part(8, 14, 4, 8, 2)
+    elseif kind == "theme" then
+        part(4, 5, 16, 16, 8, 0, false)
+        part(8, 8, 4, 4, 4); part(14, 10, 3, 3, 3); part(10, 15, 4, 4, 4)
+    elseif kind == "utility" then
+        part(4, 5, 16, 2, 1); part(4, 11, 16, 2, 1); part(4, 17, 16, 2, 1)
+        part(8, 2, 4, 8, 2); part(14, 8, 4, 8, 2); part(6, 14, 4, 8, 2)
+    elseif kind == "device" then
+        part(3, 3, 18, 14, 2, 0, false)
+        part(8, 19, 8, 2, 1); part(11, 16, 2, 4, 1)
+    end
+    return function(color)
+        for _, object in ipairs(parts) do
+            if object and object.Parent then
+                if object:IsA("UIStroke") then object.Color = color else object.BackgroundColor3 = color end
+            end
+        end
+    end
+end
+
+local navLabels = {
+    Overview = "HOME",
+    Targeting = "TARGET",
+    Visuals = "VISUALS",
+    Movement = "MOVEMENT",
+    Players = "PLAYERS",
+    Interface = "SETTINGS",
+    Plugins = "PLUGINS",
+    ["Device Info"] = "DEVICE",
+}
+
+local function makePage(name, icon, order, description)
+    local page = create("ScrollingFrame", {
+        Name = name .. "Page",
+        Size = UDim2.new(0, 220, 1, 0),
+        LayoutOrder = order,
+        BackgroundColor3 = Theme.panel,
+        BorderSizePixel = 0,
+        ScrollBarThickness = 3,
+        ScrollBarImageColor3 = Theme.accent,
+        CanvasSize = UDim2.new(0, 0, 0, 0),
+        AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y,
+        Visible = true,
+        ClipsDescendants = true,
+        ZIndex = 3,
+    }, pageHolder)
+    corner(page, 12)
+    registerGlassSurface(page, 12, false)
+    stroke(page, Theme.border, 1, 0.48)
+    padding(page, 12, 12, 11, 15)
+    create("UIListLayout", {
+        Padding = UDim.new(0, 8),
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, page)
+    pages[name] = page
+    bindAccent(function(color)
+        if not page.Parent then return false end
+        page.ScrollBarImageColor3 = color
+        return true
+    end)
+
+    local nav = create("TextButton", {
+        Name = name .. "Nav",
+        LayoutOrder = order,
+        Size = UDim2.fromOffset(96, 34),
+        BackgroundColor3 = Theme.card,
+        Text = "",
+        TextColor3 = Theme.muted,
+        Font = Enum.Font.GothamBold,
+        TextSize = 8,
+        AutoButtonColor = false,
+        Active = true,
+        Selectable = true,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, sidebar)
+    corner(nav, 9)
+    registerGlassSurface(nav, 9)
+    local navEdge = stroke(nav, Theme.border, 1, 0.5)
+    local activeMarker = create("Frame", {
+        Name = "ActiveMarker",
+        AnchorPoint = Vector2.new(0.5, 1),
+        Position = UDim2.new(0.5, 0, 1, -2),
+        Size = UDim2.fromOffset(24, 2),
+        BackgroundColor3 = Theme.text,
+        BackgroundTransparency = 1,
+        BorderSizePixel = 0,
+        ZIndex = 9,
+    }, nav)
+    corner(activeMarker, 2)
+    local navLabel = create("TextLabel", {
+        Name = "SectionName",
+        Position = UDim2.new(0, 29, 0, 0),
+        Size = UDim2.new(1, -32, 1, 0),
+        BackgroundTransparency = 1,
+        Text = navLabels[name] or string.upper(name),
+        TextColor3 = Theme.muted,
+        Font = Enum.Font.GothamBold,
+        TextSize = 9,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        ZIndex = 7,
+    }, nav)
+    navButtons[name] = nav
+    navIconUpdaters[name] = makeNavIcon(nav, icon)
+    nav.Activated:Connect(function() setPage(name, true) end)
+    bindAccent(function(color)
+        if nav.Parent then
+            navEdge.Color = name == state.page and Theme.text or Theme.border
+            nav.BackgroundColor3 = name == state.page and Theme.secondary or Theme.card
+            navLabel.TextColor3 = name == state.page and Theme.text or Theme.muted
+            activeMarker.BackgroundColor3 = Theme.text
+            activeMarker.BackgroundTransparency = name == state.page and 0 or 1
+            navIconUpdaters[name](name == state.page and Theme.text or Theme.muted)
+            return true
+        end
+        return false
+    end)
+    return page
+end
+
+local overview = makePage("Overview", "overview", 1, "Status and quick info")
+profileCard.Parent = overview
+profileCard.LayoutOrder = -100
+local targetPage = makePage("Targeting", "target", 2, "Target selection, activation, and tracking preferences")
+local visualPage = makePage("Visuals", "visuals", 3, "Player markers, labels, and visual indicators")
+local movementPage = makePage("Movement", "movement", 4, "Character and vehicle movement preferences")
+local playersPage = makePage("Players", "players", 5, "Local player list and selection")
+local interfacePage = makePage("Interface", "interface", 6, "General settings and notifications")
+local pluginsPage = makePage("Plugins", "plugins", 7, "Preset manager and team-based configurations")
+local devicePage = makePage("Device Info", "device", 8, "Device capabilities and runtime details")
+
+local function section(parent, title, subtitle)
+    local wrap = create("Frame", {
+        Size = UDim2.new(1, 0, 0, subtitle and 44 or 22),
+        BackgroundTransparency = 1,
+        ZIndex = 4,
+    }, parent)
+    create("TextLabel", {
+        Position = UDim2.fromOffset(1, 0),
+        Size = UDim2.new(1, -2, 0, 16),
+        BackgroundTransparency = 1,
+        Text = title:upper(),
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamBlack,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        ZIndex = 4,
+    }, wrap)
+    local accentBar = create("Frame", {
+        Position = UDim2.fromOffset(1, 19),
+        Size = UDim2.fromOffset(24, 2),
+        BackgroundColor3 = Theme.accent,
+        BorderSizePixel = 0,
+        ZIndex = 4,
+    }, wrap)
+    corner(accentBar, 2)
+    bindAccent(function(color) if accentBar.Parent then accentBar.BackgroundColor3 = color end end)
+    if subtitle then
+        create("TextLabel", {
+            Position = UDim2.fromOffset(1, 25),
+            Size = UDim2.new(1, -2, 0, 18),
+            BackgroundTransparency = 1,
+            Text = subtitle,
+            TextColor3 = Theme.muted,
+            Font = Enum.Font.Gotham,
+            TextSize = 8,
+            TextWrapped = true,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextYAlignment = Enum.TextYAlignment.Top,
+            ZIndex = 4,
+        }, wrap)
+    end
+    return wrap
+end
+
+local function card(parent, height)
+    local frame = create("Frame", {
+        Size = UDim2.new(1, 0, 0, height or 46),
+        BackgroundColor3 = Theme.card,
+        BorderSizePixel = 0,
+        ClipsDescendants = false,
+        ZIndex = 4,
+    }, parent)
+    corner(frame, 10)
+    stroke(frame, Theme.border, 1, 0.52)
+    registerGlassSurface(frame, 10)
+    local topSheen = create("Frame", {
+        Position = UDim2.new(0, 12, 0, 0),
+        Size = UDim2.new(0.28, 0, 0, 1),
+        BackgroundColor3 = Theme.accent,
+        BackgroundTransparency = 0.22,
+        BorderSizePixel = 0,
+        ZIndex = 5,
+    }, frame)
+    corner(topSheen, 2)
+    bindAccent(function(color) if topSheen.Parent then topSheen.BackgroundColor3 = color end end)
+    return frame
+end
+
+local function label(parent, text, position, size, options)
+    options = options or {}
+    return create("TextLabel", {
+        Position = position,
+        Size = size,
+        BackgroundTransparency = 1,
+        Text = text,
+        TextColor3 = options.color or Theme.text,
+        Font = options.font or Enum.Font.GothamMedium,
+        TextSize = options.textSize or 11,
+        TextXAlignment = options.align or Enum.TextXAlignment.Left,
+        TextYAlignment = options.yAlign or Enum.TextYAlignment.Center,
+        TextWrapped = options.wrapped or false,
+        TextTruncate = options.truncate and Enum.TextTruncate.AtEnd or Enum.TextTruncate.None,
+        ZIndex = options.zIndex or 5,
+    }, parent)
+end
+
+local function addToggle(parent, title, description, default, key, onChanged)
+    local h = description and 57 or 43
+    local row = card(parent, h)
+    label(row, title, UDim2.fromOffset(12, description and 5 or 0), UDim2.new(1, -62, 0, description and 18 or h), {textSize = 10, wrapped = false, truncate = true})
+    if description then
+        label(row, description, UDim2.fromOffset(12, 29), UDim2.new(1, -24, 0, 16), {color = Theme.muted, textSize = 9, wrapped = false, truncate = true})
+    end
+    local track = create("TextButton", {
+        AnchorPoint = Vector2.new(1, description and 0 or 0.5),
+        Position = description and UDim2.new(1, -11, 0, 7) or UDim2.new(1, -11, 0.5, 0),
+        Size = UDim2.fromOffset(38, 21),
+        BackgroundColor3 = default and Theme.accent or Theme.off,
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, row)
+    corner(track, 20)
+    registerGlassSurface(track, 20)
+    local knob = create("Frame", {
+        AnchorPoint = Vector2.new(0, 0.5),
+        Position = default and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 3, 0.5, 0),
+        Size = UDim2.fromOffset(14, 14),
+        BackgroundColor3 = Color3.new(1,1,1),
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, track)
+    corner(knob, 20)
+    local on = default == true
+    values[key or title] = on
+    bindAccent(function(color)
+        if track.Parent and on then track.BackgroundColor3 = color end
+    end)
+    local function set(value, notify)
+        on = value == true
+        values[key or title] = on
+        animate(track, state.reduceMotion and 0.06 or 0.20, {BackgroundColor3 = on and Theme.accent or Theme.off})
+        animate(knob, state.reduceMotion and 0.07 or 0.22, {Position = on and UDim2.new(1, -18, 0.5, 0) or UDim2.new(0, 3, 0.5, 0)}, state.reduceMotion and Enum.EasingStyle.Linear or Enum.EasingStyle.Back)
+        if notify then
+            particleBurst(track.AbsolutePosition + track.AbsoluteSize / 2, Theme.accent)
+            if notify ~= "silent" then toast(title .. (on and " enabled" or " disabled")) end
+        end
+        if onChanged then
+            local ok, err = pcall(onChanged, on)
+            if not ok then warn("ScriptEngine toggle callback failed:", err) end
+        end
+    end
+    track.Activated:Connect(function()
+        if key == "Notifications" then
+            set(not on, false)
+        else
+            set(not on, true)
+        end
+    end)
+    local data = {row = row, set = set, get = function() return on end}
+    valueControls[key or title] = {kind = "toggle", set = function(v) set(v == true, false) end, get = data.get, row = row}
+    return data
+end
+
+local function addDropdown(parent, title, options, default, key, onChanged)
+    local baseHeight = 57
+    local row = card(parent, baseHeight)
+    row.Name = (key or title:gsub("%W", "")) .. "Dropdown"
+    label(row, title, UDim2.fromOffset(12, 3), UDim2.new(1, -24, 0, 17), {textSize = 10})
+    local pick = create("TextButton", {
+        Name = "SelectedOption",
+        Position = UDim2.new(0, 9, 0, 24),
+        Size = UDim2.new(1, -18, 0, 25),
+        BackgroundColor3 = Theme.secondary,
+        Text = "  " .. tostring(default) .. "   v",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamMedium,
+        TextSize = 10,
+        TextXAlignment = Enum.TextXAlignment.Left,
+        TextTruncate = Enum.TextTruncate.AtEnd,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 8,
+    }, row)
+    corner(pick, 7)
+    registerGlassSurface(pick, 7)
+    local edge = stroke(pick, Theme.border, 1, 0.5)
+    bindAccent(function(color) if edge.Parent then edge.Color = color end end)
+
+    local selected = default
+    local expanded = false
+    local menu
+    local function closeMenu()
+        expanded = false
+        if menu and menu.Parent then menu:Destroy() end
+        menu = nil
+        row.Size = UDim2.new(1, 0, 0, baseHeight)
+        pick.Text = "  " .. tostring(selected) .. "   v"
+    end
+    local function choose(option, silent)
+        selected = option
+        values[key or title] = option
+        closeMenu()
+        pick.Text = "  " .. tostring(selected) .. "   v"
+        if not silent then
+            particleBurst(pick.AbsolutePosition + pick.AbsoluteSize / 2, Theme.accent)
+            toast(title .. ": " .. tostring(option) .. " · UI value")
+        end
+        if onChanged then
+            local ok, err = pcall(onChanged, option)
+            if not ok then warn("ScriptEngine dropdown callback failed:", err) end
+        end
+    end
+    values[key or title] = default
+
+    local function openMenu()
+        if expanded then closeMenu(); return end
+        if menu and menu.Parent then menu:Destroy() end
+        expanded = true
+        local itemHeight = 27
+        local menuHeight = math.clamp(#options * itemHeight, itemHeight, 135)
+        row.Size = UDim2.new(1, 0, 0, baseHeight + menuHeight + 5)
+        pick.Text = "  " .. tostring(selected) .. "   ^"
+        menu = create("ScrollingFrame", {
+            Name = "DropdownOptions",
+            Position = UDim2.new(0, 9, 0, 53),
+            Size = UDim2.new(1, -18, 0, menuHeight),
+            BackgroundColor3 = Theme.panel,
+            BorderSizePixel = 0,
+            CanvasSize = UDim2.new(0, 0, 0, 0),
+            AutomaticCanvasSize = Enum.AutomaticSize.Y,
+            ScrollingDirection = Enum.ScrollingDirection.Y,
+            ScrollBarThickness = 3,
+            ScrollBarImageColor3 = Theme.accent,
+            ClipsDescendants = true,
+            ZIndex = 20,
+        }, row)
+        corner(menu, 7)
+        registerGlassSurface(menu, 7, false)
+        stroke(menu, Theme.accent, 1, 0.12)
+        local list = create("UIListLayout", {
+            Padding = UDim.new(0, 3),
+            SortOrder = Enum.SortOrder.LayoutOrder,
+        }, menu)
+        create("UIPadding", {
+            PaddingTop = UDim.new(0, 4),
+            PaddingBottom = UDim.new(0, 4),
+            PaddingLeft = UDim.new(0, 4),
+            PaddingRight = UDim.new(0, 4),
+        }, menu)
+        for i, option in ipairs(options) do
+            local item = create("TextButton", {
+                Name = "Option" .. tostring(i),
+                LayoutOrder = i,
+                Size = UDim2.new(1, -4, 0, 25),
+                BackgroundColor3 = option == selected and Theme.accent or Theme.card,
+                Text = "  " .. tostring(option),
+                TextColor3 = Theme.text,
+                Font = Enum.Font.GothamMedium,
+                TextSize = 10,
+                TextXAlignment = Enum.TextXAlignment.Left,
+                AutoButtonColor = false,
+                BorderSizePixel = 0,
+                ZIndex = 22,
+            }, menu)
+            corner(item, 5)
+            registerGlassSurface(item, 5)
+            bindAccent(function(color)
+                if not item.Parent then return false end
+                if option == selected then item.BackgroundColor3 = color end
+                return true
+            end)
+            item.Activated:Connect(function() choose(option) end)
+            item.MouseEnter:Connect(function()
+                if values.HoverEffects ~= false and option ~= selected then
+                    animate(item, 0.1, {BackgroundColor3 = Theme.cardHover})
+                end
+            end)
+            item.MouseLeave:Connect(function()
+                if item.Parent and option ~= selected then
+                    animate(item, 0.1, {BackgroundColor3 = Theme.card})
+                end
+            end)
+        end
+    end
+    pick.Activated:Connect(openMenu)
+    local data = {
+        row = row,
+        set = function(option) choose(option, true) end,
+        get = function() return selected end,
+        refresh = function(newOptions)
+            options = newOptions or options
+            if expanded then closeMenu() end
+            if not table.find(options, selected) then
+                selected = options[1] or "None"
+                values[key or title] = selected
+                pick.Text = "  " .. tostring(selected) .. "   v"
+            end
+        end,
+    }
+    valueControls[key or title] = {kind = "dropdown", set = data.set, get = data.get, refresh = data.refresh, row = row}
+    return data
+end
+
+local function addSlider(parent, title, minValue, maxValue, defaultValue, key, onChanged)
+    local row = card(parent, 59)
+    label(row, title, UDim2.fromOffset(12, 4), UDim2.new(1, -78, 0, 17), {textSize = 9, truncate = true})
+    local number = label(row, tostring(defaultValue), UDim2.new(1, -64, 0, 4), UDim2.fromOffset(51, 17), {color = Theme.accent, textSize = 10, align = Enum.TextXAlignment.Right, font = Enum.Font.GothamBold})
+    bindAccent(function(color)
+        if not number.Parent then return false end
+        number.TextColor3 = color
+        return true
+    end)
+    local track = create("TextButton", {
+        Name = "SliderTrack_" .. tostring(key or title):gsub("%W", ""),
+        Position = UDim2.new(0, 12, 0, 35),
+        Size = UDim2.new(1, -24, 0, 8),
+        BackgroundColor3 = Theme.off,
+        Text = "",
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        Active = true,
+        Selectable = false,
+        ZIndex = 6,
+    }, row)
+    corner(track, 10)
+    registerGlassSurface(track, 10)
+    local ratio = math.clamp((defaultValue - minValue) / math.max(1, maxValue - minValue), 0, 1)
+    local fill = create("Frame", {
+        Size = UDim2.new(ratio, 0, 1, 0),
+        BackgroundColor3 = Theme.accent,
+        BorderSizePixel = 0,
+        ZIndex = 7,
+    }, track)
+    corner(fill, 10)
+    bindAccent(function(color) if fill.Parent then fill.BackgroundColor3 = color; return true end return false end)
+    local knob = create("TextButton", {
+        Name = "SliderKnob",
+        AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = UDim2.new(ratio, 0, 0.5, 0),
+        Size = UDim2.fromOffset(18, 18),
+        BackgroundColor3 = Theme.text,
+        Text = "",
+        AutoButtonColor = false,
+        Active = true,
+        Selectable = false,
+        BorderSizePixel = 0,
+        ZIndex = 9,
+    }, track)
+    corner(knob, 20)
+    local knobEdge = stroke(knob, Theme.accent, 1.1, 0.02)
+    bindAccent(function(color) if knobEdge.Parent then knobEdge.Color = color; return true end return false end)
+    local knobScale = create("UIScale", {Scale = 1}, knob)
+    values[key or title] = defaultValue
+    local dragging = false
+    local activeInput = nil
+    local previousDeckScroll = true
+    local parentScroller = parent:IsA("ScrollingFrame") and parent or parent:FindFirstAncestorWhichIsA("ScrollingFrame")
+    local previousParentScroll = parentScroller and parentScroller.ScrollingEnabled or true
+    local function update(x)
+        local r = math.clamp((x - track.AbsolutePosition.X) / math.max(1, track.AbsoluteSize.X), 0, 1)
+        local v = math.floor(minValue + r * (maxValue - minValue) + 0.5)
+        values[key or title] = v
+        number.Text = tostring(v)
+        animate(fill, state.reduceMotion and 0.02 or 0.055, {Size = UDim2.new(r, 0, 1, 0)}, Enum.EasingStyle.Linear)
+        knob.Position = UDim2.new(r, 0, 0.5, 0)
+        if onChanged then
+            local ok, err = pcall(onChanged, v)
+            if not ok then warn("ScriptEngine slider callback failed:", err) end
+        end
+    end
+    local function beginDrag(input)
+        if dragging or (state.activeSlider and state.activeSlider ~= track) then return end
+        if input.UserInputType ~= Enum.UserInputType.MouseButton1 and input.UserInputType ~= Enum.UserInputType.Touch then return end
+        dragging = true
+        activeInput = input
+        state.sliderDragging = true
+        state.activeSlider = track
+        previousDeckScroll = true
+        if pageHolder then previousDeckScroll = pageHolder.ScrollingEnabled end
+        previousParentScroll = true
+        if parentScroller then previousParentScroll = parentScroller.ScrollingEnabled end
+        -- Temporarily reserve the gesture for the slider so the category deck cannot swipe.
+        if pageHolder then pageHolder.ScrollingEnabled = false end
+        if parentScroller then parentScroller.ScrollingEnabled = false end
+        animate(knobScale, state.reduceMotion and 0.04 or 0.09, {Scale = 1.16}, Enum.EasingStyle.Back)
+        update(input.Position.X)
+    end
+    local function endDrag(input)
+        if not dragging then return end
+        if activeInput and activeInput.UserInputType == Enum.UserInputType.Touch then
+            if input.UserInputType ~= Enum.UserInputType.Touch or input ~= activeInput then return end
+        elseif input.UserInputType ~= Enum.UserInputType.MouseButton1 then
+            return
+        end
+        dragging = false
+        activeInput = nil
+        state.sliderDragging = false
+        state.activeSlider = nil
+        if pageHolder and pageHolder.Parent then pageHolder.ScrollingEnabled = previousDeckScroll end
+        if parentScroller and parentScroller.Parent then parentScroller.ScrollingEnabled = previousParentScroll end
+        animate(knobScale, state.reduceMotion and 0.04 or 0.12, {Scale = 1}, Enum.EasingStyle.Back)
+    end
+    track.InputBegan:Connect(beginDrag)
+    knob.InputBegan:Connect(beginDrag)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and activeInput and activeInput.UserInputType == Enum.UserInputType.MouseButton1
+            and input.UserInputType == Enum.UserInputType.MouseMovement then
+            update(input.Position.X)
+        end
+    end)
+    -- TouchMoved/TouchEnded retain the same InputObject for a finger's whole gesture.
+    UserInputService.TouchMoved:Connect(function(input)
+        if dragging and activeInput and activeInput.UserInputType == Enum.UserInputType.Touch and input == activeInput then
+            update(input.Position.X)
+        end
+    end)
+    UserInputService.InputEnded:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 then endDrag(input) end
+    end)
+    UserInputService.TouchEnded:Connect(function(input)
+        if activeInput == input then endDrag(input) end
+    end)
+    local function setSliderValue(value, runCallback)
+        local v = math.clamp(math.floor((tonumber(value) or minValue) + 0.5), minValue, maxValue)
+        local r = math.clamp((v - minValue) / math.max(1, maxValue - minValue), 0, 1)
+        values[key or title] = v
+        number.Text = tostring(v)
+        animate(fill, state.reduceMotion and 0.02 or 0.08, {Size = UDim2.new(r, 0, 1, 0)}, Enum.EasingStyle.Quad)
+        animate(knob, state.reduceMotion and 0.02 or 0.10, {Position = UDim2.new(r, 0, 0.5, 0)}, Enum.EasingStyle.Quad)
+        if runCallback ~= false and onChanged then
+            local ok, err = pcall(onChanged, v)
+            if not ok then warn("ScriptEngine slider setter failed:", err) end
+        end
+    end
+    valueControls[key or title] = {kind = "slider", set = function(v) setSliderValue(v, true) end, get = function() return values[key or title] end, row = row}
+    return row
+end
+
+local function addAction(parent, title, buttonText, callback)
+    local row = card(parent, 46)
+    label(row, title, UDim2.fromOffset(12, 0), UDim2.new(1, -105, 1, 0), {textSize = 10})
+    local b = create("TextButton", {
+        AnchorPoint = Vector2.new(1, 0.5),
+        Position = UDim2.new(1, -9, 0.5, 0),
+        Size = UDim2.fromOffset(79, 27),
+        BackgroundColor3 = Theme.secondary,
+        Text = buttonText or "RUN",
+        TextColor3 = Theme.text,
+        Font = Enum.Font.GothamBold,
+        TextSize = 8,
+        AutoButtonColor = false,
+        BorderSizePixel = 0,
+        ZIndex = 6,
+    }, row)
+    corner(b, 8)
+    registerGlassSurface(b, 8)
+    local edge = stroke(b, Theme.accent, 1, 0.42)
+    bindAccent(function(color) if edge.Parent then edge.Color = color end end)
+    b.Activated:Connect(function()
+        particleBurst(b.AbsolutePosition + b.AbsoluteSize / 2, Theme.accent)
+        if callback then callback() else toast(title .. " updated") end
+    end)
+    b.MouseEnter:Connect(function() if values.HoverEffects ~= false then animate(b, 0.12, {BackgroundColor3 = Theme.cardHover}) end end)
+    b.MouseLeave:Connect(function() animate(b, 0.12, {BackgroundColor3 = Theme.secondary}) end)
+    return row
+end
+
+local function addVisualPreview(parent)
+    local preview = card(parent, 196)
+    preview.Name = "VisualOverlayPreview"
+    label(preview, "OVERLAY PREVIEW", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+    label(preview, "MOCK TARGET / PREVIEW ONLY", UDim2.new(1, -12, 0, 5), UDim2.fromOffset(112, 15), {font = Enum.Font.GothamBold, textSize = 7, color = Theme.accent, align = Enum.TextXAlignment.Right})
+    local stage = create("Frame", {
+        Position = UDim2.fromOffset(10, 28), Size = UDim2.new(1, -20, 1, -38),
+        BackgroundColor3 = Theme.panel, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 6,
+    }, preview)
+    corner(stage, 8)
+    stroke(stage, Theme.border, 1, 0.42)
+    local horizon = create("Frame", {
+        Position = UDim2.new(0, 0, 0.72, 0), Size = UDim2.new(1, 0, 0, 1),
+        BackgroundColor3 = Theme.border, BackgroundTransparency = 0.48, BorderSizePixel = 0, ZIndex = 7,
+    }, stage)
+    local target = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0.78, 0), Size = UDim2.fromOffset(64, 86),
+        BackgroundColor3 = Theme.accent, BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 9,
+    }, stage)
+    corner(target, 5)
+    local targetEdge = stroke(target, Theme.accent, 1.5, 0.04)
+    local fill = create("Frame", {
+        Position = UDim2.new(0, 4, 0, 4), Size = UDim2.new(1, -8, 1, -8),
+        BackgroundColor3 = Theme.accent, BackgroundTransparency = 0.91, BorderSizePixel = 0, ZIndex = 8,
+    }, target)
+    corner(fill, 4)
+    local nameBacking = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 1), Position = UDim2.new(0.5, 0, 0, -4), Size = UDim2.fromOffset(90, 17),
+        BackgroundColor3 = Theme.background, BackgroundTransparency = 0.24, BorderSizePixel = 0, ZIndex = 10,
+    }, target)
+    corner(nameBacking, 4)
+    local nameText = label(nameBacking, "SamplePlayer", UDim2.fromScale(0, 0), UDim2.fromScale(1, 1), {font = Enum.Font.GothamBold, textSize = 9, align = Enum.TextXAlignment.Center, zIndex = 11, truncate = true})
+    local distanceText = label(target, "86 studs", UDim2.new(0.5, -45, 1, 3), UDim2.fromOffset(90, 14), {textSize = 8, color = Theme.muted, align = Enum.TextXAlignment.Center, zIndex = 11})
+    local healthTrack = create("Frame", {
+        AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(0, -5, 0, 0), Size = UDim2.fromOffset(3, 86),
+        BackgroundColor3 = Theme.off, BorderSizePixel = 0, ZIndex = 10,
+    }, target)
+    corner(healthTrack, 3)
+    local healthFill = create("Frame", {
+        AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 0, 1, 0), Size = UDim2.new(1, 0, 0.72, 0),
+        BackgroundColor3 = Theme.accent, BorderSizePixel = 0, ZIndex = 11,
+    }, healthTrack)
+    corner(healthFill, 3)
+    local healthText = label(target, "72 HP", UDim2.new(1, 6, 0.5, -7), UDim2.fromOffset(42, 14), {textSize = 7, color = Theme.text, zIndex = 11})
+    local edgeArrow = create("TextLabel", {
+        AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -8, 0.28, 0), Size = UDim2.fromOffset(17, 17),
+        BackgroundTransparency = 1, Text = ">", TextColor3 = Theme.accent, Font = Enum.Font.GothamBlack, TextSize = 16, ZIndex = 9,
+    }, stage)
+    bindAccent(function(color)
+        if not preview.Parent then return false end
+        targetEdge.Color = color
+        fill.BackgroundColor3 = color
+        healthFill.BackgroundColor3 = color
+        edgeArrow.TextColor3 = color
+        return true
+    end)
+    return {
+        setBoxStyle = function(style)
+            local filled = style == "Filled"
+            target.BackgroundTransparency = 1
+            fill.BackgroundTransparency = filled and 0.82 or 1
+            targetEdge.Thickness = style == "Corner" and 2 or (style == "3D" and 1.8 or 1.2)
+        end,
+        setBoxVisible = function(enabled) target.Visible = enabled end,
+        setNameVisible = function(enabled) nameBacking.Visible = enabled end,
+        setLabelBackground = function(enabled) nameBacking.BackgroundTransparency = enabled and 0.24 or 1 end,
+        setDistanceVisible = function(enabled) distanceText.Visible = enabled end,
+        setHealthVisible = function(enabled)
+            healthTrack.Visible = enabled
+            healthText.Visible = enabled
+        end,
+        setArrowVisible = function(enabled) edgeArrow.Visible = enabled end,
+        setLabelSize = function(value) nameText.TextSize = math.clamp(value, 8, 18) end,
+        setLabelFont = function(value)
+            local fonts = {Gotham = Enum.Font.Gotham, Code = Enum.Font.Code, SourceSans = Enum.Font.SourceSans, Fantasy = Enum.Font.Fantasy}
+            nameText.Font = fonts[value] or Enum.Font.Gotham
+        end,
+        setThickness = function(value) targetEdge.Thickness = math.clamp(value, 1, 5) end,
+        setOpacity = function(value) fill.BackgroundTransparency = 1 - math.clamp(value, 0, 100) / 100 * 0.24 end,
+    }
+end
+
+local function addTargetPreview(parent)
+    local preview = card(parent, 182)
+    preview.Name = "TargetingPreview"
+    label(preview, "TARGETING PREVIEW", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+    label(preview, "LOCAL MOCK / NO AUTOMATION", UDim2.new(1, -12, 0, 5), UDim2.fromOffset(128, 15), {font = Enum.Font.GothamBold, textSize = 7, color = Theme.accent, align = Enum.TextXAlignment.Right})
+    local stage = create("Frame", {
+        Position = UDim2.fromOffset(10, 28), Size = UDim2.new(1, -20, 1, -38),
+        BackgroundColor3 = Theme.panel, BorderSizePixel = 0, ClipsDescendants = true, ZIndex = 6,
+    }, preview)
+    corner(stage, 8)
+    stroke(stage, Theme.border, 1, 0.42)
+    local fov = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.54), Size = UDim2.fromOffset(102, 102),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 7,
+    }, stage)
+    corner(fov, 100)
+    local fovEdge = stroke(fov, Theme.accent, 1.25, 0.32)
+    local marker = create("Frame", {
+        AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.55, 0, 0.49, 0), Size = UDim2.fromOffset(12, 12),
+        BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 9,
+    }, stage)
+    local markerParts = {}
+    for _, definition in ipairs({{5, 0, 2, 12}, {0, 5, 12, 2}}) do
+        local part = create("Frame", {
+            Position = UDim2.fromOffset(definition[1], definition[2]), Size = UDim2.fromOffset(definition[3], definition[4]),
+            BackgroundColor3 = Theme.accent, BorderSizePixel = 0, ZIndex = 10,
+        }, marker)
+        corner(part, 2)
+        table.insert(markerParts, part)
+    end
+    local mockCard = create("Frame", {
+        Position = UDim2.fromOffset(8, 8), Size = UDim2.fromOffset(92, 36),
+        BackgroundColor3 = Theme.background, BackgroundTransparency = 0.16, BorderSizePixel = 0, ZIndex = 10,
+    }, stage)
+    corner(mockCard, 6)
+    label(mockCard, "MOCK TARGET", UDim2.fromOffset(6, 4), UDim2.new(1, -12, 0, 11), {textSize = 7, color = Theme.muted, font = Enum.Font.GothamBold, zIndex = 11})
+    local mockName = label(mockCard, "SamplePlayer / 86", UDim2.fromOffset(6, 17), UDim2.new(1, -12, 0, 13), {textSize = 8, color = Theme.text, zIndex = 11, truncate = true})
+    bindAccent(function(color)
+        if not preview.Parent then return false end
+        fovEdge.Color = color
+        for _, part in ipairs(markerParts) do part.BackgroundColor3 = color end
+        return true
+    end)
+    return {
+        setFovVisible = function(enabled) fov.Visible = enabled end,
+        setFovRadius = function(value)
+            local size = math.floor(58 + math.clamp(value, 10, 500) * 0.17)
+            fov.Size = UDim2.fromOffset(size, size)
+        end,
+        setFovOpacity = function(value) fovEdge.Transparency = 1 - math.clamp(value, 0, 100) / 100 * 0.72 end,
+        setMarkerVisible = function(enabled) marker.Visible = enabled end,
+        setTargetCardVisible = function(enabled) mockCard.Visible = enabled end,
+        setMarkerAnchor = function(value) mockName.Text = "SamplePlayer / " .. tostring(value) end,
+    }
+end
+
+local function addMovementPreview(parent)
+    local preview = card(parent, 103)
+    preview.Name = "MovementConfigurationPreview"
+    label(preview, "MOVEMENT CONFIGURATION", UDim2.fromOffset(12, 6), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+    local mode = label(preview, "PROFILE: DEFAULT", UDim2.fromOffset(12, 29), UDim2.new(1, -24, 0, 17), {font = Enum.Font.GothamBlack, textSize = 11, color = Theme.accent, truncate = true})
+    label(preview, "Preview values stay in this interface and do not change character or vehicle movement.", UDim2.fromOffset(12, 51), UDim2.new(1, -24, 0, 37), {textSize = 8, color = Theme.muted, wrapped = true, yAlign = Enum.TextYAlignment.Top})
+    bindAccent(function(color) if mode.Parent then mode.TextColor3 = color; return true end return false end)
+    return {
+        setProfile = function(value) mode.Text = "PROFILE: " .. string.upper(tostring(value)) end,
+        setControlMode = function(value) mode.Text = "CONTROL: " .. string.upper(tostring(value)) end,
+    }
+end
+
+local function addThemeGallery(parent, onSelected)
+    local gallery = card(parent, 136)
+    gallery.Name = "ThemeModeGallery"
+    label(gallery, "THEME MODE GALLERY", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+    label(gallery, "Applies supported accent, RGB, and glass settings", UDim2.fromOffset(12, 19), UDim2.new(1, -24, 0, 12), {textSize = 7, color = Theme.muted, truncate = true})
+    local holder = create("Frame", {Position = UDim2.fromOffset(10, 36), Size = UDim2.new(1, -20, 1, -46), BackgroundTransparency = 1, ZIndex = 6}, gallery)
+    create("UIGridLayout", {CellSize = UDim2.new(0.5, -4, 0, 38), CellPadding = UDim2.fromOffset(8, 7), FillDirectionMaxCells = 2, SortOrder = Enum.SortOrder.LayoutOrder}, holder)
+    local buttons = {}
+    local selected = "Graphite"
+    local modes = {
+        {"Graphite", "MATTE DEFAULT"}, {"Silver Frost", "FROSTED GLASS"},
+        {"RGB", "ACCENT CYCLE"}, {"Glass", "TRANSLUCENT"},
+    }
+    local function refresh()
+        for name, button in pairs(buttons) do
+            button.BackgroundColor3 = name == selected and Theme.secondary or Theme.card
+            local edge = button:FindFirstChildOfClass("UIStroke")
+            if edge then edge.Color = name == selected and Theme.accent or Theme.border end
+        end
+    end
+    for index, definition in ipairs(modes) do
+        local name, subtitle = definition[1], definition[2]
+        local button = create("TextButton", {
+            Name = name:gsub("%s", "") .. "ThemeMode", LayoutOrder = index, Size = UDim2.new(0.5, -4, 0, 38),
+            BackgroundColor3 = name == selected and Theme.secondary or Theme.card, Text = name .. "\n" .. subtitle,
+            TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 8, TextWrapped = true,
+            AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 7,
+        }, holder)
+        corner(button, 7)
+        stroke(button, name == selected and Theme.accent or Theme.border, 1, 0.38)
+        buttons[name] = button
+        button.Activated:Connect(function()
+            selected = name
+            refresh()
+            if onSelected then onSelected(name) end
+        end)
+    end
+    bindAccent(function()
+        if not gallery.Parent then return false end
+        refresh()
+        return true
+    end)
+    return {select = function(name) selected = name; refresh() end}
+end
+
+local function addPluginCatalog(parent)
+    local manager = card(parent, 267)
+    manager.Name = "BuiltInPluginCatalog"
+    label(manager, "BUILT-IN UI DEMOS", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+    label(manager, "LOCAL PREVIEWS / NO EXTERNAL CODE LOADING", UDim2.new(1, -12, 0, 5), UDim2.fromOffset(154, 15), {font = Enum.Font.GothamBold, textSize = 7, color = Theme.accent, align = Enum.TextXAlignment.Right})
+    local list = create("ScrollingFrame", {
+        Name = "PluginDemoList", Position = UDim2.fromOffset(8, 25), Size = UDim2.new(1, -16, 0, 177),
+        BackgroundColor3 = Theme.panel, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0), AutomaticCanvasSize = Enum.AutomaticSize.Y,
+        ScrollingDirection = Enum.ScrollingDirection.Y, ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent, ClipsDescendants = true, ZIndex = 6,
+    }, manager)
+    corner(list, 7)
+    stroke(list, Theme.border, 1, 0.42)
+    create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, list)
+    padding(list, 4, 4, 4, 4)
+    local detail = create("Frame", {Position = UDim2.new(0, 8, 1, -57), Size = UDim2.new(1, -16, 0, 48), BackgroundColor3 = Theme.secondary, BorderSizePixel = 0, ZIndex = 6}, manager)
+    corner(detail, 7)
+    local detailTitle = label(detail, "SELECT A DEMO", UDim2.fromOffset(7, 4), UDim2.new(1, -14, 0, 12), {textSize = 8, color = Theme.accent, font = Enum.Font.GothamBold, truncate = true, zIndex = 7})
+    local detailText = label(detail, "Each demo is a local interface placeholder; it never loads code or affects gameplay.", UDim2.fromOffset(7, 17), UDim2.new(1, -14, 0, 26), {textSize = 7, color = Theme.text, wrapped = true, yAlign = Enum.TextYAlignment.Top, zIndex = 7})
+    local rows = {}
+    local function addDemo(name, category, version, description)
+        local row = card(list, 51)
+        row.Name = name:gsub("%s", "") .. "PluginDemo"
+        label(row, name, UDim2.fromOffset(7, 3), UDim2.new(1, -108, 0, 14), {textSize = 8, font = Enum.Font.GothamBold, truncate = true, zIndex = 8})
+        label(row, category:upper() .. " / v" .. version, UDim2.fromOffset(7, 17), UDim2.new(1, -108, 0, 10), {textSize = 6, color = Theme.muted, font = Enum.Font.GothamBold, truncate = true, zIndex = 8})
+        label(row, description, UDim2.fromOffset(7, 28), UDim2.new(1, -108, 0, 16), {textSize = 7, color = Theme.muted, truncate = true, zIndex = 8})
+        local demoState = create("TextButton", {
+            AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -50, 0, 5), Size = UDim2.fromOffset(43, 17),
+            BackgroundColor3 = Theme.off, Text = "DEMO OFF", TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 6,
+            AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 9,
+        }, row)
+        corner(demoState, 5)
+        local open = create("TextButton", {
+            AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -50, 1, -5), Size = UDim2.fromOffset(43, 17),
+            BackgroundColor3 = Theme.secondary, Text = "DETAIL", TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 6,
+            AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 9,
+        }, row)
+        corner(open, 5)
+        local demoOn = false
+        demoState.Activated:Connect(function()
+            demoOn = not demoOn
+            demoState.Text = demoOn and "DEMO ON" or "DEMO OFF"
+            demoState.BackgroundColor3 = demoOn and Theme.accent or Theme.off
+            detailTitle.Text = name:upper() .. (demoOn and " / DEMO ON" or " / DEMO OFF")
+            detailText.Text = demoOn and "Local preview state enabled. No plugin code is installed or executed." or "Local preview state disabled. No gameplay state was changed."
+        end)
+        open.Activated:Connect(function()
+            detailTitle.Text = name:upper() .. " / " .. category:upper()
+            detailText.Text = description .. " This is a built-in UI demonstration only."
+        end)
+        table.insert(rows, {category = category, row = row})
+    end
+    addDemo("Theme Designer", "Appearance", "1.0", "Review supported accent and glass modes")
+    addDemo("Notification Studio", "Appearance", "1.0", "Preview local confirmation styling")
+    addDemo("Keybind Manager", "Utility", "1.0", "Mock keybind layout and labels")
+    addDemo("Layout Presets", "Utility", "1.0", "Preview compact and spacious arrangements")
+    addDemo("Session Dashboard", "Diagnostics", "1.0", "Sample session metrics with mock data")
+    addDemo("Performance Monitor", "Diagnostics", "1.0", "Read-only sample performance presentation")
+    bindAccent(function(color)
+        if not manager.Parent then return false end
+        list.ScrollBarImageColor3 = color
+        detailTitle.TextColor3 = color
+        return true
+    end)
+    return {
+        filter = function(category)
+            local visibleCount = 0
+            for _, item in ipairs(rows) do
+                local visible = category == "All" or item.category == category
+                item.row.Visible = visible
+                if visible then visibleCount += 1 end
+            end
+            detailTitle.Text = visibleCount == 0 and "NO MATCHING DEMOS" or (tostring(visibleCount) .. " DEMOS AVAILABLE")
+            detailText.Text = visibleCount == 0 and "Try another category. Built-in demos remain local and preview-only." or "Select a demo to inspect its local, preview-only presentation."
+        end,
+    }
+end
+
+local function addPalette(parent)
+    local paletteCard = card(parent, 90)
+    label(paletteCard, "MONOCHROME ACCENTS", UDim2.fromOffset(12, 4), UDim2.new(1, -24, 0, 17), {textSize = 9, color = Theme.muted, font = Enum.Font.GothamBold})
+    local colors = {
+        Color3.fromRGB(245, 245, 245),
+        Color3.fromRGB(214, 214, 214),
+        Color3.fromRGB(184, 184, 184),
+        Color3.fromRGB(150, 150, 150),
+        Color3.fromRGB(116, 116, 116),
+        Color3.fromRGB(82, 82, 82),
+        Color3.fromRGB(52, 52, 52),
+    }
+    local holder = create("Frame", {
+        Position = UDim2.new(0, 10, 0, 27),
+        Size = UDim2.new(1, -20, 0, 58),
+        BackgroundTransparency = 1,
+        ZIndex = 6,
+    }, paletteCard)
+    create("UIGridLayout", {
+        CellSize = UDim2.fromOffset(25, 25),
+        CellPadding = UDim2.fromOffset(8, 5),
+        FillDirection = Enum.FillDirection.Horizontal,
+        FillDirectionMaxCells = 4,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, holder)
+    for i, color in ipairs(colors) do
+        local swatch = create("TextButton", {
+            LayoutOrder = i,
+            Size = UDim2.fromOffset(25, 25),
+            BackgroundColor3 = color,
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            ZIndex = 7,
+        }, holder)
+        corner(swatch, 9)
+        local edge = stroke(swatch, Color3.new(1,1,1), 1, 0.7)
+        swatch.Activated:Connect(function()
+            state.rgb = false
+            values.RGB = false
+            if rgbToggleData then rgbToggleData.set(false, "silent") end
+            applyAccent(color)
+            toast("Accent preset applied")
+        end)
+        swatch.MouseEnter:Connect(function() if values.HoverEffects ~= false then animate(swatch, 0.12, {Size = UDim2.fromOffset(29, 29)}) end end)
+        swatch.MouseLeave:Connect(function() animate(swatch, 0.12, {Size = UDim2.fromOffset(25, 25)}) end)
+    end
+end
+
+local function addChromaticPalette(parent)
+    local paletteCard = card(parent, 90)
+    label(paletteCard, "CHROMATIC ACCENTS", UDim2.fromOffset(12, 4), UDim2.new(1, -24, 0, 17), {textSize = 9, color = Theme.muted, font = Enum.Font.GothamBold})
+    label(paletteCard, "Color presets are separate from neutral monochrome accents", UDim2.fromOffset(12, 19), UDim2.new(1, -24, 0, 12), {textSize = 7, color = Theme.muted, truncate = true})
+    local colors = {
+        Color3.fromRGB(72, 205, 224),
+        Color3.fromRGB(89, 145, 255),
+        Color3.fromRGB(157, 111, 255),
+        Color3.fromRGB(245, 103, 173),
+        Color3.fromRGB(255, 124, 96),
+        Color3.fromRGB(255, 187, 91),
+        Color3.fromRGB(102, 220, 166),
+    }
+    local holder = create("Frame", {
+        Position = UDim2.new(0, 10, 0, 34),
+        Size = UDim2.new(1, -20, 0, 54),
+        BackgroundTransparency = 1,
+        ZIndex = 6,
+    }, paletteCard)
+    create("UIGridLayout", {
+        CellSize = UDim2.fromOffset(25, 25),
+        CellPadding = UDim2.fromOffset(8, 4),
+        FillDirection = Enum.FillDirection.Horizontal,
+        FillDirectionMaxCells = 4,
+        SortOrder = Enum.SortOrder.LayoutOrder,
+    }, holder)
+    for i, color in ipairs(colors) do
+        local swatch = create("TextButton", {
+            Name = "ColorAccentPreset" .. tostring(i),
+            LayoutOrder = i,
+            Size = UDim2.fromOffset(25, 25),
+            BackgroundColor3 = color,
+            Text = "",
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            ZIndex = 7,
+        }, holder)
+        corner(swatch, 9)
+        local edge = stroke(swatch, Color3.new(1, 1, 1), 1, 0.65)
+        local scale = create("UIScale", {Scale = 1}, swatch)
+        swatch.Activated:Connect(function()
+            state.rgb = false
+            values.RGB = false
+            if rgbToggleData then rgbToggleData.set(false, "silent") end
+            applyAccent(color)
+            toast("Chromatic accent applied")
+            animate(scale, 0.1, {Scale = 0.88}, Enum.EasingStyle.Back, Enum.EasingDirection.Out)
+            task.delay(0.10, function() if scale.Parent then animate(scale, 0.16, {Scale = 1}, Enum.EasingStyle.Back) end end)
+        end)
+        swatch.MouseEnter:Connect(function()
+            if values.HoverEffects ~= false then animate(scale, 0.12, {Scale = 1.12}, Enum.EasingStyle.Back) end
+        end)
+        swatch.MouseLeave:Connect(function() animate(scale, 0.12, {Scale = 1}) end)
+        bindAccent(function(activeColor)
+            if not swatch.Parent then return false end
+            -- Accent selection has a subtle edge cue without tinting the swatch itself.
+            edge.Transparency = (activeColor == color) and 0.08 or 0.65
+            return true
+        end)
+    end
+end
+
+-- OVERVIEW: compact, one-column layout.
+section(overview, "ABOUT SCRIPTENGINE", "A little information about ScriptEngine")
+local hero = card(overview, 137)
+local heroStripe = create("Frame", {
+    Position = UDim2.fromOffset(0, 12),
+    Size = UDim2.fromOffset(3, 113),
+    BackgroundColor3 = Theme.accent,
+    BorderSizePixel = 0,
+    ZIndex = 6,
+}, hero)
+corner(heroStripe, 3)
+bindAccent(function(color) if heroStripe.Parent then heroStripe.BackgroundColor3 = color end end)
+label(hero, "SCRIPTENGINE / KEYLESS", UDim2.fromOffset(14, 12), UDim2.new(1, -28, 0, 22), {font = Enum.Font.GothamBlack, textSize = 12, truncate = true})
+local heroStatus = label(hero, "KEYLESS VERSION NOW AVAILABLE", UDim2.fromOffset(14, 41), UDim2.new(1, -28, 0, 19), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.text, truncate = true})
+-- Status text remains neutral for ScriptEngine branding.
+label(hero, "ScriptEngine is currently available in a keyless version. If a key system returns in the future, it will remain effortless and quick.", UDim2.fromOffset(14, 67), UDim2.new(1, -28, 0, 61), {textSize = 9, color = Theme.muted, wrapped = true})
+
+-- TARGETING: local configuration and visual preview only; no automated targeting is implemented.
+section(targetPage, "Targeting preview studio", "Configure mock target presentation, field-of-view visuals, and local selection preferences")
+local targetPreview = addTargetPreview(targetPage)
+addToggle(targetPage, "Show FOV circle", "Shows the field-of-view circle in the mock preview only", true, "FOVPreview", targetPreview.setFovVisible)
+addToggle(targetPage, "Show target marker", "Shows a marker on the mock target; it does not select players", true, "TargetMarkerPreview", targetPreview.setMarkerVisible)
+addToggle(targetPage, "Show target card", "Shows mock target information in the preview", true, "TargetCardPreview", targetPreview.setTargetCardVisible)
+addToggle(targetPage, "Team preference", "Stores a local mock selection preference only", true, "TeamCheck")
+addToggle(targetPage, "Friend preference", "Stores a local mock selection preference only", true, "FriendCheck")
+addToggle(targetPage, "Visibility preference", "Displays a local configuration state; no line-of-sight checks run", false, "VisibilityCheck")
+addDropdown(targetPage, "Marker anchor", {"Head", "Upper torso", "Root", "Lower torso", "Center"}, "Head", "TargetPart", targetPreview.setMarkerAnchor)
+addDropdown(targetPage, "Preview activation", {"Hold", "Toggle", "Always visible"}, "Hold", "ActivationStyle")
+addDropdown(targetPage, "Mock priority", {"Cursor proximity", "Distance", "Health", "Recent"}, "Cursor proximity", "PriorityMode")
+addSlider(targetPage, "FOV radius", 10, 500, 120, "FOVRadius", targetPreview.setFovRadius)
+addSlider(targetPage, "FOV opacity", 10, 100, 68, "FOVOpacity", targetPreview.setFovOpacity)
+addSlider(targetPage, "Mock display range", 50, 2000, 500, "MaxRange")
+addAction(targetPage, "Reset preview appearance", "RESET", function()
+    valueControls.FOVPreview.set(true)
+    valueControls.TargetMarkerPreview.set(true)
+    valueControls.TargetCardPreview.set(true)
+    valueControls.FOVRadius.set(120)
+    valueControls.FOVOpacity.set(68)
+    toast("Targeting preview reset")
+end)
+
+-- VISUALS: mock overlay styling; no player overlay is created in an experience.
+section(visualPage, "Visual overlay studio", "Adjust a representative overlay with preview-only controls and clear display limits")
+local visualPreview = addVisualPreview(visualPage)
+addToggle(visualPage, "Overlay preview", "Shows the representative mock overlay, not an in-game ESP", true, "ESP", visualPreview.setBoxVisible)
+addToggle(visualPage, "Box outlines", "Shows the mock target frame in the preview", true, "BoxESP", visualPreview.setBoxVisible)
+addToggle(visualPage, "Name labels", "Shows the mock target name label", true, "NameESP", visualPreview.setNameVisible)
+addToggle(visualPage, "Label background", "Shows a readable background behind the mock name", true, "LabelBackground", visualPreview.setLabelBackground)
+addToggle(visualPage, "Distance labels", "Shows mock distance information", true, "DistanceESP", visualPreview.setDistanceVisible)
+addToggle(visualPage, "Health display", "Shows a mock health bar and value", true, "HealthESP", visualPreview.setHealthVisible)
+addToggle(visualPage, "Off-screen indicator", "Shows a mock screen-edge direction cue", false, "OffscreenArrows", visualPreview.setArrowVisible)
+addToggle(visualPage, "Tracer preference", "Stores a preview preference; no world tracer is drawn", false, "TracerESP")
+addToggle(visualPage, "Rig-outline preference", "Stores a preview preference; no character data is inspected", false, "SkeletonESP")
+addDropdown(visualPage, "Box style", {"Corner", "2D", "3D", "Filled"}, "Corner", "BoxStyle", visualPreview.setBoxStyle)
+addDropdown(visualPage, "Label font", {"Gotham", "Code", "SourceSans", "Fantasy"}, "Gotham", "LabelFont", visualPreview.setLabelFont)
+addDropdown(visualPage, "Color preset", {"Current accent", "Silver", "Slate", "High contrast"}, "Current accent", "OverlayColorPreset")
+addSlider(visualPage, "Label size", 8, 24, 13, "LabelSize", visualPreview.setLabelSize)
+addSlider(visualPage, "Outline thickness", 1, 5, 1, "LineThickness", visualPreview.setThickness)
+addSlider(visualPage, "Fill opacity", 0, 100, 38, "FillOpacity", visualPreview.setOpacity)
+addSlider(visualPage, "Mock display limit", 1, 30, 12, "DisplayLimit")
+
+-- MOVEMENT: configuration mock-up only; values never alter a character, vehicle, or world physics.
+section(movementPage, "Movement configuration", "Organize local movement preferences without applying movement changes")
+local selectedPlayer = nil
+local movementPreview = addMovementPreview(movementPage)
+addDropdown(movementPage, "Control mode", {"Default", "Keyboard", "Touch", "Gamepad"}, "Default", "MovementControlMode", movementPreview.setControlMode)
+addDropdown(movementPage, "Movement profile", {"Default", "Cautious", "Responsive", "Custom"}, "Default", "MovementProfile", movementPreview.setProfile)
+addDropdown(movementPage, "Preview keybind", {"Shift", "LeftControl", "Button L3", "On-screen"}, "Shift", "MovementPreviewKeybind")
+addToggle(movementPage, "Walk-speed preview", "Keeps a local value for authorized experience design; no speed is changed", false, "MoveWalkSpeed")
+addSlider(movementPage, "Walk-speed preview value", 8, 80, 16, "MoveWalkSpeedValue")
+addToggle(movementPage, "Jump preview", "Keeps a local value only; no jump behavior is changed", false, "MoveJumpPower")
+addSlider(movementPage, "Jump preview value", 20, 150, 50, "MoveJumpPowerValue")
+addToggle(movementPage, "Air-control preview", "Displays a local configuration state; no airborne movement is applied", false, "MoveFlight")
+addSlider(movementPage, "Air-control preview value", 10, 150, 45, "MoveFlightSpeed")
+section(movementPage, "Vehicle configuration", "Separate local vehicle presentation values from ordinary movement controls")
+addToggle(movementPage, "Vehicle mode preview", "Shows a local preview state only", false, "VehicleFlight")
+addSlider(movementPage, "Vehicle speed preview", 10, 250, 60, "VehicleFlightSpeed")
+addSlider(movementPage, "Vehicle height preview", 10, 400, 100, "VehicleFlightHeight")
+addToggle(movementPage, "Vehicle stability preference", "Stores a local interface preference only", true, "VehicleStabilization")
+addAction(movementPage, "Preview selected profile", "PREVIEW", function()
+    local name = selectedPlayer and selectedPlayer.Name or "no player selected"
+    toast("Movement preview refreshed for " .. name)
+end)
+addAction(movementPage, "Reset movement values", "RESET", function()
+    valueControls.MoveWalkSpeedValue.set(16)
+    valueControls.MoveJumpPowerValue.set(50)
+    valueControls.MoveFlightSpeed.set(45)
+    valueControls.VehicleFlightSpeed.set(60)
+    valueControls.VehicleFlightHeight.set(100)
+    valueControls.MovementProfile.set("Default")
+    valueControls.MovementControlMode.set("Default")
+    toast("Movement preview values reset")
+end)
+
+-- PLAYERS: browse and select players in the current server.
+section(playersPage, "Player browser", "Browse players in the current server and select a destination")
+local playerSummary = card(playersPage, 58)
+label(playerSummary, "CONNECTED PLAYERS", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 17), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+local playerCountLabel = label(playerSummary, "0 players", UDim2.fromOffset(12, 26), UDim2.new(1, -24, 0, 21), {font = Enum.Font.GothamBlack, textSize = 15, color = Theme.text})
+local playerListCard = card(playersPage, 215)
+label(playerListCard, "PLAYER LIST  /  TAP TO SELECT", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 18), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+local playerList = create("ScrollingFrame", {
+    Name = "PlayerList",
+    Position = UDim2.new(0, 9, 0, 29),
+    Size = UDim2.new(1, -18, 1, -38),
+    BackgroundColor3 = Theme.panel,
+    BorderSizePixel = 0,
+    CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y,
+    ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 3,
+    ScrollBarImageColor3 = Theme.accent,
+    ClipsDescendants = true,
+    ZIndex = 6,
+}, playerListCard)
+corner(playerList, 8)
+stroke(playerList, Theme.border, 1, 0.3)
+bindAccent(function(color)
+    if not playerList.Parent then return false end
+    playerList.ScrollBarImageColor3 = color
+    return true
+end)
+create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, playerList)
+create("UIPadding", {PaddingTop = UDim.new(0, 4), PaddingBottom = UDim.new(0, 4), PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4)}, playerList)
+local selectedPlayerVisible = nil
+local selectedPlayerLabel = label(playersPage, "SELECTED: NONE", UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 1), {textSize = 1})
+selectedPlayerLabel.Visible = false
+local playerRows = {}
+local function clearPlayerRows()
+    for _, child in ipairs(playerList:GetChildren()) do
+        if child:IsA("GuiObject") then child:Destroy() end
+    end
+    table.clear(playerRows)
+end
+local function refreshPlayers()
+    clearPlayerRows()
+    local list = Players:GetPlayers()
+    table.sort(list, function(a, b) return string.lower(a.Name) < string.lower(b.Name) end)
+    playerCountLabel.Text = tostring(#list) .. (#list == 1 and " player" or " players")
+    for index, listedPlayer in ipairs(list) do
+        local isLocal = listedPlayer == player
+        local row = create("TextButton", {
+            Name = "Player_" .. listedPlayer.UserId,
+            LayoutOrder = index,
+            Size = UDim2.new(1, -4, 0, 32),
+            BackgroundColor3 = listedPlayer == selectedPlayer and Theme.accent or Theme.card,
+            Text = "  " .. (isLocal and "YOU  /  " or "      ") .. listedPlayer.Name,
+            TextColor3 = Theme.text,
+            Font = Enum.Font.GothamMedium,
+            TextSize = 10,
+            TextXAlignment = Enum.TextXAlignment.Left,
+            TextTruncate = Enum.TextTruncate.AtEnd,
+            AutoButtonColor = false,
+            BorderSizePixel = 0,
+            ZIndex = 8,
+        }, playerList)
+        corner(row, 7)
+        registerGlassSurface(row, 7)
+        local edge = stroke(row, listedPlayer == selectedPlayer and Theme.text or Theme.border, 1, 0.4)
+        bindAccent(function(color)
+            if not row.Parent then return false end
+            if listedPlayer == selectedPlayer then
+                row.BackgroundColor3 = color
+                edge.Color = Theme.text
+            end
+            return true
+        end)
+        row.Activated:Connect(function()
+            selectedPlayer = listedPlayer
+            selectedPlayerLabel.Text = "SELECTED: " .. listedPlayer.Name
+            if selectedPlayerVisible and selectedPlayerVisible.Parent then selectedPlayerVisible.Text = listedPlayer.Name end
+            for p, item in pairs(playerRows) do
+                local isSelected = p == listedPlayer
+                animate(item, 0.12, {BackgroundColor3 = isSelected and Theme.accent or Theme.card})
+                local itemEdge = item:FindFirstChildOfClass("UIStroke")
+                if itemEdge then itemEdge.Color = isSelected and Theme.text or Theme.border end
+            end
+            toast("Selected player: " .. listedPlayer.Name)
+        end)
+        playerRows[listedPlayer] = row
+    end
+    if selectedPlayer and not selectedPlayer.Parent then
+        selectedPlayer = nil
+        selectedPlayerLabel.Text = "SELECTED: NONE"
+    end
+    if selectedPlayer then selectedPlayerLabel.Text = "SELECTED: " .. selectedPlayer.Name end
+    if selectedPlayerVisible and selectedPlayerVisible.Parent then
+        selectedPlayerVisible.Text = selectedPlayer and selectedPlayer.Name or "NONE"
+    end
+    if #list == 0 then
+        local empty = label(playerList, "No players found", UDim2.fromOffset(8, 0), UDim2.new(1, -16, 0, 28), {textSize = 10, color = Theme.muted})
+        empty.LayoutOrder = 1
+    end
+end
+refreshPlayers()
+Players.PlayerAdded:Connect(refreshPlayers)
+Players.PlayerRemoving:Connect(refreshPlayers)
+local playerActions = card(playersPage, 87)
+label(playerActions, "SELECTED PLAYER", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 16), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+selectedPlayerVisible = label(playerActions, "NONE", UDim2.fromOffset(12, 24), UDim2.new(1, -24, 0, 18), {font = Enum.Font.GothamBlack, textSize = 12, color = Theme.accent, truncate = true})
+bindAccent(function(color)
+    if not selectedPlayerVisible.Parent then return false end
+    selectedPlayerVisible.TextColor3 = color
+    return true
+end)
+addAction(playersPage, "Refresh player list", "REFRESH", refreshPlayers)
+-- SETTINGS: general options and every appearance/theme control live together.
+section(interfacePage, "General settings", "Personal preferences and interface behavior")
+local notifyToggle = addToggle(interfacePage, "Notifications", "Show brief confirmations for completed UI actions", false, "Notifications")
+notifyToggle.row.Name = "NotificationsControl"
+local notificationInfo = card(interfacePage, 62)
+label(notificationInfo, "NOTIFICATION BEHAVIOUR", UDim2.fromOffset(12, 7), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+label(notificationInfo, "Enable this switch to show short confirmation messages. Changing this switch stays silent.", UDim2.fromOffset(12, 25), UDim2.new(1, -24, 0, 30), {textSize = 9, color = Theme.text, wrapped = true})
+
+section(interfacePage, "Motion & interaction", "Group related feedback and animation controls together")
+local particleToggle = addToggle(interfacePage, "Particle bursts", "Small accent particles when interacting with controls", true, "Particles")
+local motionToggle = addToggle(interfacePage, "Reduce motion", "Reduce decorative movement and disable orbit spin", false, "ReduceMotion")
+addToggle(interfacePage, "Button hover effects", "Decorative hover and press feedback", true, "HoverEffects")
+addDropdown(interfacePage, "Animation profile", {"Smooth", "Snappy", "Soft", "Minimal"}, "Smooth", "AnimationProfile")
+addSlider(interfacePage, "UI content scale", 90, 110, 97, "UIContentScale", function(value)
+    bodyScale.Scale = value / 100
+end)
+
+section(interfacePage, "Accent & glass", "Appearance options belong to Settings, not a separate section")
+local rgbToggle = addToggle(interfacePage, "RGB accent cycle", "Cycle one synchronized accent across the entire interface", false, "RGB")
+rgbToggleData = rgbToggle
+local glassToggle = addToggle(interfacePage, "Glass UI", "Translucent accent-tinted surfaces with a frosted finish", false, "GlassUI")
+addSlider(interfacePage, "Glass blur strength", 0, 100, 42, "GlassBlur", function(value)
+    applyGlass(state.glass, value)
+end)
+label(interfacePage, "LOW = clearer / fluid glass   ·   HIGH = stronger blur / frost", UDim2.new(0, 12, 0, 0), UDim2.new(1, -24, 0, 14), {textSize = 8, color = Theme.muted, wrapped = true})
+
+section(interfacePage, "Monochrome accents", "Neutral greys for the default ScriptEngine look")
+addPalette(interfacePage)
+section(interfacePage, "Chromatic accents", "Colorful presets remain separate from grayscale")
+addChromaticPalette(interfacePage)
+addAction(interfacePage, "Random grayscale accent", "RANDOM", function()
+    state.rgb = false
+    values.RGB = false
+    if rgbToggleData then rgbToggleData.set(false, "silent") end
+    local shade = math.random(150, 242)
+    applyAccent(Color3.fromRGB(shade, shade, shade))
+    toast("Random grayscale accent applied")
+end)
+addAction(interfacePage, "Reset accent", "RESET", function()
+    state.rgb = false
+    values.RGB = false
+    if rgbToggleData then rgbToggleData.set(false, "silent") end
+    applyAccent(Color3.fromRGB(214, 214, 214))
+    toast("Default grayscale accent restored")
+end)
+particleToggle.row.Name = "ParticlesControl"
+motionToggle.row.Name = "ReduceMotionControl"
+rgbToggle.row.Name = "RGBControl"
+glassToggle.row.Name = "GlassUIControl"
+applyGlass(false, values.GlassBlur or 42)
+
+-- Keep appearance flags synchronized after a toggle or preset changes its stored value.
+local function syncToggles()
+    state.particles = values.Particles ~= false
+    state.reduceMotion = values.ReduceMotion == true
+    state.notifications = values.Notifications == true
+    state.rgb = values.RGB == true
+    state.glass = values.GlassUI == true
+    applyGlass(state.glass, values.GlassBlur or 42)
+end
+for _, toggleData in ipairs({particleToggle, motionToggle, notifyToggle, rgbToggle, glassToggle}) do
+    local button = toggleData.row:FindFirstChildWhichIsA("TextButton")
+    if button then button.Activated:Connect(function() task.defer(syncToggles) end) end
+end
+syncToggles()
+
+section(interfacePage, "Theme modes", "Quick combinations of settings already supported by this interface")
+local function applyThemeMode(name)
+    local modes = {
+        Graphite = {accent = Color3.fromRGB(214, 214, 214), rgb = false, glass = false, blur = 42},
+        ["Silver Frost"] = {accent = Color3.fromRGB(235, 235, 235), rgb = false, glass = true, blur = 58},
+        RGB = {accent = Color3.fromHSV(state.hue, 0.72, 1), rgb = true, glass = false, blur = 42},
+        Glass = {accent = Color3.fromRGB(188, 205, 220), rgb = false, glass = true, blur = 42},
+    }
+    local mode = modes[name]
+    if not mode then return end
+    values.RGB = mode.rgb
+    values.GlassUI = mode.glass
+    if valueControls.GlassBlur then valueControls.GlassBlur.set(mode.blur) end
+    rgbToggle.set(mode.rgb, "silent")
+    glassToggle.set(mode.glass, "silent")
+    applyAccent(mode.accent)
+    syncToggles()
+    toast(name .. " theme mode applied")
+end
+addThemeGallery(interfacePage, applyThemeMode)
+section(interfacePage, "Preview & accessibility", "Test local notification styling and keep controls readable")
+addAction(interfacePage, "Preview notification", "PREVIEW", function()
+    toast("ScriptEngine notification preview", true)
+end)
+addAction(interfacePage, "Reset interface scale", "RESET", function()
+    valueControls.UIContentScale.set(97)
+    toast("UI content scale restored")
+end)
+
+-- PLUGINS: safe local UI demonstrations alongside the existing preset manager.
+section(pluginsPage, "Plugin library", "Browse built-in interface demonstrations without loading external code")
+local pluginCatalog = addPluginCatalog(pluginsPage)
+addDropdown(pluginsPage, "Plugin category", {"All", "Appearance", "Utility", "Diagnostics"}, "All", "PluginCategory", function(category)
+    pluginCatalog.filter(category)
+end)
+section(pluginsPage, "Preset manager", "Save and restore your current interface configuration")
+local presetStatusCard = card(pluginsPage, 43)
+local presetStatusLabel = label(presetStatusCard, "PRESETS  /  SESSION STORAGE", UDim2.fromOffset(12, 0), UDim2.new(1, -24, 1, 0), {textSize = 9, font = Enum.Font.GothamBold, color = Theme.muted, truncate = true})
+local presetNameCard = card(pluginsPage, 75)
+label(presetNameCard, "CREATE PRESET", UDim2.fromOffset(12, 4), UDim2.new(1, -24, 0, 15), {textSize = 9, color = Theme.muted, font = Enum.Font.GothamBold})
+local presetNameBox = create("TextBox", {
+    Name = "PresetNameInput", Position = UDim2.fromOffset(10, 24), Size = UDim2.new(1, -91, 0, 31),
+    BackgroundColor3 = Theme.secondary, BorderSizePixel = 0, ClearTextOnFocus = false,
+    PlaceholderText = "Preset name…", Text = "", TextColor3 = Theme.text, PlaceholderColor3 = Theme.muted,
+    Font = Enum.Font.GothamMedium, TextSize = 10, TextXAlignment = Enum.TextXAlignment.Left,
+    TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 7,
+}, presetNameCard)
+corner(presetNameBox, 7); stroke(presetNameBox, Theme.border, 1, 0.35); padding(presetNameBox, 8, 6, 0, 0)
+local presetSaveButton = create("TextButton", {
+    Name = "SavePresetButton", AnchorPoint = Vector2.new(1, 0), Position = UDim2.new(1, -10, 0, 24),
+    Size = UDim2.fromOffset(71, 31), BackgroundColor3 = Theme.secondary, Text = "SAVE",
+    TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 9, AutoButtonColor = false,
+    BorderSizePixel = 0, ZIndex = 7,
+}, presetNameCard)
+corner(presetSaveButton, 7); stroke(presetSaveButton, Theme.accent, 1, 0.28)
+bindAccent(function(color) if presetSaveButton.Parent then presetSaveButton:FindFirstChildOfClass("UIStroke").Color = color; return true end return false end)
+local presetsListCard = card(pluginsPage, 193)
+label(presetsListCard, "SAVED PRESETS  /  SELECT · LOAD · DELETE", UDim2.fromOffset(12, 4), UDim2.new(1, -24, 0, 16), {textSize = 8, color = Theme.muted, font = Enum.Font.GothamBold, truncate = true})
+local presetListScroll = create("ScrollingFrame", {
+    Name = "PresetList", Position = UDim2.new(0, 8, 0, 25), Size = UDim2.new(1, -16, 1, -32),
+    BackgroundColor3 = Theme.panel, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent, ClipsDescendants = true, ZIndex = 6,
+}, presetsListCard)
+corner(presetListScroll, 7); stroke(presetListScroll, Theme.border, 1, 0.4)
+create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, presetListScroll)
+padding(presetListScroll, 4, 4, 4, 4)
+local selectedPresetName = nil
+local presetAutoDropdown
+local teamDropdown
+local teamPresetDropdown
+local teamLinkScroll
+local teamLinkStatus
+local savePreset, loadPreset, refreshPresetList, refreshPresetPickers, refreshTeamLinkList
+
+local function getPresetNames()
+    local names = {}
+    for _, item in ipairs(presetFolder:GetChildren()) do
+        if item:IsA("Folder") then table.insert(names, item.Name) end
+    end
+    table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
+    return names
+end
+local function getPresetOptions()
+    local options = {"None"}
+    for _, name in ipairs(getPresetNames()) do table.insert(options, name) end
+    return options
+end
+local function getTeamOptions()
+    local names = {}
+    for _, team in ipairs(Teams:GetChildren()) do
+        if team:IsA("Team") then table.insert(names, team.Name) end
+    end
+    table.sort(names, function(a, b) return string.lower(a) < string.lower(b) end)
+    if #names == 0 then return {"No teams available"} end
+    return names
+end
+
+section(pluginsPage, "Autoload", "Apply a selected preset when ScriptEngine is initialized again in this client session")
+presetAutoDropdown = addDropdown(pluginsPage, "Autoload preset", getPresetOptions(), presetStorage:GetAttribute("AutoLoadPreset") or "None", "AutoLoadPreset", function(option)
+    presetStorage:SetAttribute("AutoLoadPreset", option == "None" and "" or option)
+    presetStatusLabel.Text = option == "None" and "AUTOLOAD  /  OFF" or ("AUTOLOAD  /  " .. option)
+end)
+addAction(pluginsPage, "Clear autoload preset", "CLEAR", function()
+    presetStorage:SetAttribute("AutoLoadPreset", "")
+    if presetAutoDropdown then presetAutoDropdown.set("None") end
+    values.AutoLoadPreset = "None"
+    presetStatusLabel.Text = "AUTOLOAD  /  OFF"
+    toast("Autoload cleared")
+end)
+
+section(pluginsPage, "Team-based presets", "Assign one saved preset to each team in the current experience")
+teamDropdown = addDropdown(pluginsPage, "Team", getTeamOptions(), getTeamOptions()[1], "TeamPresetTeam")
+teamPresetDropdown = addDropdown(pluginsPage, "Preset for this team", getPresetOptions(), "None", "TeamPresetChoice")
+addAction(pluginsPage, "Assign preset to selected team", "ASSIGN", function()
+    local teamName = teamDropdown and teamDropdown.get() or "No teams available"
+    local presetName = teamPresetDropdown and teamPresetDropdown.get() or "None"
+    if teamName == "No teams available" or not Teams:FindFirstChild(teamName) then
+        if teamLinkStatus then teamLinkStatus.Text = "No teams are defined in this experience." end
+        toast("No team available to assign")
+        return
+    end
+    if presetName == "None" or not presetFolder:FindFirstChild(presetName) then
+        toast("Choose a saved preset first")
+        return
+    end
+    local link = teamPresetFolder:FindFirstChild(teamName)
+    if not link then link = Instance.new("StringValue"); link.Name = teamName; link.Parent = teamPresetFolder end
+    link.Value = presetName
+    if teamLinkStatus then teamLinkStatus.Text = teamName .. "  →  " .. presetName end
+    if refreshTeamLinkList then refreshTeamLinkList() end
+    toast("Team preset assigned")
+end)
+local teamLinkCard = card(pluginsPage, 145)
+label(teamLinkCard, "TEAM MAPPINGS", UDim2.fromOffset(12, 4), UDim2.new(1, -24, 0, 16), {textSize = 8, font = Enum.Font.GothamBold, color = Theme.muted})
+teamLinkScroll = create("ScrollingFrame", {
+    Name = "TeamPresetMappings", Position = UDim2.new(0, 8, 0, 24), Size = UDim2.new(1, -16, 1, -31),
+    BackgroundColor3 = Theme.panel, BorderSizePixel = 0, CanvasSize = UDim2.new(0, 0, 0, 0),
+    AutomaticCanvasSize = Enum.AutomaticSize.Y, ScrollingDirection = Enum.ScrollingDirection.Y,
+    ScrollBarThickness = 3, ScrollBarImageColor3 = Theme.accent, ClipsDescendants = true, ZIndex = 6,
+}, teamLinkCard)
+corner(teamLinkScroll, 7); stroke(teamLinkScroll, Theme.border, 1, 0.4)
+create("UIListLayout", {Padding = UDim.new(0, 4), SortOrder = Enum.SortOrder.LayoutOrder}, teamLinkScroll)
+padding(teamLinkScroll, 4, 4, 4, 4)
+teamLinkStatus = label(pluginsPage, "TEAM RULES APPLY WHEN YOUR TEAM CHANGES", UDim2.new(0, 0, 0, 0), UDim2.new(1, 0, 0, 1), {textSize = 1})
+teamLinkStatus.Visible = false
+
+local presetToastTicket = 0
+local function setPresetStatus(text)
+    presetToastTicket += 1
+    local ticket = presetToastTicket
+    presetStatusLabel.Text = text
+    task.delay(1.8, function()
+        if ticket == presetToastTicket and presetStatusLabel.Parent then
+            presetStatusLabel.Text = "PRESETS  /  " .. tostring(#getPresetNames()) .. " SAVED  ·  SESSION STORAGE"
+        end
+    end)
+end
+
+refreshPresetList = function()
+    for _, child in ipairs(presetListScroll:GetChildren()) do
+        if child:IsA("GuiObject") and not child:IsA("UIListLayout") and not child:IsA("UIPadding") then child:Destroy() end
+    end
+    local names = getPresetNames()
+    if #names == 0 then
+        local empty = label(presetListScroll, "No saved presets yet", UDim2.fromOffset(3, 0), UDim2.new(1, -6, 0, 28), {textSize = 9, color = Theme.muted})
+        empty.Name = "EmptyPresetNotice"
+        empty.LayoutOrder = 1
+    else
+        for index, name in ipairs(names) do
+            local row = create("Frame", {
+                Name = "PresetRow_" .. tostring(index), LayoutOrder = index,
+                Size = UDim2.new(1, -2, 0, 34), BackgroundColor3 = name == selectedPresetName and Theme.secondary or Theme.card,
+                BorderSizePixel = 0, ZIndex = 7,
+            }, presetListScroll)
+            corner(row, 6)
+            local rowEdge = stroke(row, name == selectedPresetName and Theme.accent or Theme.border, 1, 0.48)
+            local selectButton = create("TextButton", {
+                Name = "SelectPreset", Position = UDim2.fromOffset(3, 2), Size = UDim2.new(1, -102, 1, -4),
+                BackgroundTransparency = 1, Text = "  " .. name, TextColor3 = Theme.text,
+                Font = Enum.Font.GothamMedium, TextSize = 9, TextXAlignment = Enum.TextXAlignment.Left,
+                TextTruncate = Enum.TextTruncate.AtEnd, AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 8,
+            }, row)
+            local loadButton = create("TextButton", {
+                Name = "LoadPreset", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -39, 0.5, 0),
+                Size = UDim2.fromOffset(40, 25), BackgroundColor3 = Theme.secondary, Text = "LOAD",
+                TextColor3 = Theme.text, Font = Enum.Font.GothamBold, TextSize = 8, AutoButtonColor = false,
+                BorderSizePixel = 0, ZIndex = 8,
+            }, row)
+            corner(loadButton, 5); stroke(loadButton, Theme.accent, 1, 0.55)
+            local deleteButton = create("TextButton", {
+                Name = "DeletePreset", AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -3, 0.5, 0),
+                Size = UDim2.fromOffset(31, 25), BackgroundColor3 = Theme.secondary, Text = "×",
+                TextColor3 = Theme.muted, Font = Enum.Font.GothamBold, TextSize = 15, AutoButtonColor = false,
+                BorderSizePixel = 0, ZIndex = 8,
+            }, row)
+            corner(deleteButton, 5)
+            selectButton.Activated:Connect(function()
+                selectedPresetName = name
+                presetNameBox.Text = name
+                refreshPresetList()
+            end)
+            loadButton.Activated:Connect(function() if loadPreset then loadPreset(name) end end)
+            deleteButton.Activated:Connect(function()
+                local target = presetFolder:FindFirstChild(name)
+                if target then target:Destroy() end
+                if selectedPresetName == name then selectedPresetName = nil end
+                if presetStorage:GetAttribute("AutoLoadPreset") == name then presetStorage:SetAttribute("AutoLoadPreset", "") end
+                for _, link in ipairs(teamPresetFolder:GetChildren()) do
+                    if link:IsA("StringValue") and link.Value == name then link:Destroy() end
+                end
+                refreshPresetList()
+                if refreshPresetPickers then refreshPresetPickers() end
+                if refreshTeamLinkList then refreshTeamLinkList() end
+                setPresetStatus("PRESET DELETED  /  " .. name)
+            end)
+            selectButton.MouseEnter:Connect(function() if values.HoverEffects ~= false then animate(row, 0.10, {BackgroundColor3 = Theme.cardHover}) end end)
+            selectButton.MouseLeave:Connect(function() animate(row, 0.10, {BackgroundColor3 = name == selectedPresetName and Theme.secondary or Theme.card}) end)
+        end
+    end
+    presetStatusLabel.Text = "PRESETS  /  " .. tostring(#names) .. " SAVED  ·  SESSION STORAGE"
+end
+
+refreshPresetPickers = function()
+    local options = getPresetOptions()
+    if presetAutoDropdown then presetAutoDropdown.refresh(options) end
+    if teamPresetDropdown then teamPresetDropdown.refresh(options) end
+    if teamDropdown then teamDropdown.refresh(getTeamOptions()) end
+end
+
+refreshTeamLinkList = function()
+    for _, child in ipairs(teamLinkScroll:GetChildren()) do
+        if child:IsA("GuiObject") and not child:IsA("UIListLayout") and not child:IsA("UIPadding") then child:Destroy() end
+    end
+    local links = {}
+    for _, item in ipairs(teamPresetFolder:GetChildren()) do
+        if item:IsA("StringValue") then table.insert(links, item) end
+    end
+    table.sort(links, function(a, b) return string.lower(a.Name) < string.lower(b.Name) end)
+    if #links == 0 then
+        local empty = label(teamLinkScroll, "No team assignments yet", UDim2.fromOffset(3, 0), UDim2.new(1, -6, 0, 26), {textSize = 9, color = Theme.muted})
+        empty.Name = "EmptyTeamMappings"
+    else
+        for index, link in ipairs(links) do
+            local row = create("Frame", {
+                Name = "TeamLink_" .. tostring(index), LayoutOrder = index,
+                Size = UDim2.new(1, -2, 0, 31), BackgroundColor3 = Theme.card, BorderSizePixel = 0, ZIndex = 7,
+            }, teamLinkScroll)
+            corner(row, 6)
+            label(row, link.Name .. "  →  " .. link.Value, UDim2.fromOffset(5, 0), UDim2.new(1, -39, 1, 0), {textSize = 8, color = Theme.text, truncate = true})
+            local remove = create("TextButton", {
+                AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -3, 0.5, 0), Size = UDim2.fromOffset(28, 23),
+                BackgroundColor3 = Theme.secondary, Text = "×", TextColor3 = Theme.muted,
+                Font = Enum.Font.GothamBold, TextSize = 14, AutoButtonColor = false, BorderSizePixel = 0, ZIndex = 8,
+            }, row)
+            corner(remove, 5)
+            remove.Activated:Connect(function()
+                link:Destroy()
+                refreshTeamLinkList()
+                toast("Team preset assignment removed")
+            end)
+        end
+    end
+end
+
+savePreset = function()
+    local name = string.gsub(presetNameBox.Text or "", "[%c]", " ")
+    name = string.gsub(name, "^%s+", "")
+    name = string.gsub(name, "%s+$", "")
+    name = string.sub(name, 1, 28)
+    if name == "" then
+        setPresetStatus("ENTER A PRESET NAME FIRST")
+        toast("Enter a preset name first")
+        return
+    end
+    local preset = presetFolder:FindFirstChild(name)
+    if not preset then preset = Instance.new("Folder"); preset.Name = name; preset.Parent = presetFolder end
+    for attribute in pairs(preset:GetAttributes()) do preset:SetAttribute(attribute, nil) end
+    for key, value in pairs(values) do
+        -- The preset's own routing controls are manager metadata, not feature settings.
+        local managerOnly = key == "AutoLoadPreset" or key == "TeamPresetTeam" or key == "TeamPresetChoice"
+        local kind = typeof(value)
+        if not managerOnly and (kind == "boolean" or kind == "number" or kind == "string") then
+            preset:SetAttribute("Value_" .. key, value)
+        end
+    end
+    preset:SetAttribute("AccentR", Theme.accent.R)
+    preset:SetAttribute("AccentG", Theme.accent.G)
+    preset:SetAttribute("AccentB", Theme.accent.B)
+    preset:SetAttribute("Version", BUILD_NUMBER)
+    selectedPresetName = name
+    presetNameBox.Text = name
+    refreshPresetList()
+    refreshPresetPickers()
+    setPresetStatus("SAVED  /  " .. name)
+    toast("Preset saved: " .. name)
+end
+
+loadPreset = function(name)
+    local preset = presetFolder:FindFirstChild(name)
+    if not preset or not preset:IsA("Folder") then
+        toast("Preset not found")
+        return
+    end
+    selectedPresetName = name
+    for key, control in pairs(valueControls) do
+        local managerOnly = key == "AutoLoadPreset" or key == "TeamPresetTeam" or key == "TeamPresetChoice"
+        local saved = nil
+        if not managerOnly then saved = preset:GetAttribute("Value_" .. key) end
+        -- Preserve false boolean attributes; false is a valid saved toggle state.
+        if saved ~= nil and control.set then
+            local ok, err = pcall(control.set, saved)
+            if not ok then warn("ScriptEngine preset value failed for " .. key .. ":", err) end
+        end
+    end
+    local r, g, b = preset:GetAttribute("AccentR"), preset:GetAttribute("AccentG"), preset:GetAttribute("AccentB")
+    if typeof(r) == "number" and typeof(g) == "number" and typeof(b) == "number" then
+        applyAccent(Color3.new(math.clamp(r, 0, 1), math.clamp(g, 0, 1), math.clamp(b, 0, 1)))
+    end
+    if syncToggles then syncToggles() end
+    refreshPresetList()
+    setPresetStatus("LOADED  /  " .. name)
+    toast("Preset loaded: " .. name)
+end
+
+presetSaveButton.Activated:Connect(function() if savePreset then savePreset() end end)
+presetNameBox.FocusLost:Connect(function(enterPressed) if enterPressed and savePreset then savePreset() end end)
+presetNameBox:GetPropertyChangedSignal("Text"):Connect(function()
+    if #presetNameBox.Text > 28 then presetNameBox.Text = string.sub(presetNameBox.Text, 1, 28) end
+end)
+refreshPresetList()
+refreshPresetPickers()
+refreshTeamLinkList()
+Teams.ChildAdded:Connect(function() if refreshPresetPickers then refreshPresetPickers() end end)
+Teams.ChildRemoved:Connect(function() if refreshPresetPickers then refreshPresetPickers() end end)
+player:GetPropertyChangedSignal("Team"):Connect(function()
+    task.delay(0.08, function()
+        if state.closed or not player.Team then return end
+        local link = teamPresetFolder:FindFirstChild(player.Team.Name)
+        if link and link:IsA("StringValue") and loadPreset then loadPreset(link.Value) end
+    end)
+end)
+
+-- DEVICE INFO: only report properties exposed by the standard Roblox client API.
+section(devicePage, "Device and client info", "Live input capabilities, viewport, and current experience metadata")
+local deviceInfoValues = {}
+local deviceInfoCard = card(devicePage, 46)
+label(deviceInfoCard, "DEVICE SUMMARY", UDim2.fromOffset(12, 5), UDim2.new(1, -24, 0, 15), {font = Enum.Font.GothamBold, textSize = 9, color = Theme.muted})
+local deviceSummaryLabel = label(deviceInfoCard, "Reading current client…", UDim2.fromOffset(12, 21), UDim2.new(1, -24, 0, 17), {font = Enum.Font.GothamBlack, textSize = 12, color = Theme.accent, truncate = true})
+bindAccent(function(color) if deviceSummaryLabel.Parent then deviceSummaryLabel.TextColor3 = color; return true end return false end)
+local deviceInfoDefinitions = {
+    {"Preferred input", "PreferredInput"},
+    {"Touchscreen available", "Touch"},
+    {"Keyboard available", "Keyboard"},
+    {"Mouse available", "Mouse"},
+    {"Gamepad available", "Gamepad"},
+    {"Accelerometer available", "Accelerometer"},
+    {"Gyroscope available", "Gyroscope"},
+    {"Viewport resolution", "Viewport"},
+    {"Screen orientation", "Orientation"},
+    {"Camera field of view", "CameraFOV"},
+    {"Local player", "Player"},
+    {"Experience", "Experience"},
+    {"Place ID", "PlaceId"},
+    {"Place version", "PlaceVersion"},
+    {"Players in this server", "Players"},
+    {"Client context", "ClientContext"},
+    {"Executor identification", "Executor"},
+    {"OS / device model", "DeviceModel"},
+    {"CPU / RAM / GPU", "Hardware"},
+}
+for _, definition in ipairs(deviceInfoDefinitions) do
+    local row = card(devicePage, 48)
+    label(row, definition[1], UDim2.fromOffset(11, 2), UDim2.new(1, -22, 0, 15), {textSize = 8, color = Theme.muted, truncate = true})
+    local valueLabel = label(row, "—", UDim2.fromOffset(11, 18), UDim2.new(1, -22, 0, 26), {textSize = 10, color = Theme.text, wrapped = true})
+    deviceInfoValues[definition[2]] = valueLabel
+end
+local function refreshDeviceInfo(quiet)
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.zero
+    local preferred = "Unavailable"
+    pcall(function() preferred = UserInputService.PreferredInput.Name end)
+    local orientation = viewport.X >= viewport.Y and "Landscape" or "Portrait"
+    local fov = workspace.CurrentCamera and string.format("%.1f°", workspace.CurrentCamera.FieldOfView) or "Unavailable"
+    local info = {
+        PreferredInput = preferred,
+        Touch = UserInputService.TouchEnabled and "Yes" or "No",
+        Keyboard = UserInputService.KeyboardEnabled and "Yes" or "No",
+        Mouse = UserInputService.MouseEnabled and "Yes" or "No",
+        Gamepad = UserInputService.GamepadEnabled and "Yes" or "No",
+        Accelerometer = UserInputService.AccelerometerEnabled and "Yes" or "No",
+        Gyroscope = UserInputService.GyroscopeEnabled and "Yes" or "No",
+        Viewport = string.format("%d × %d px", math.floor(viewport.X), math.floor(viewport.Y)),
+        Orientation = orientation,
+        CameraFOV = fov,
+        Player = player.Name,
+        Experience = game.Name ~= "" and game.Name or "Current experience",
+        PlaceId = tostring(game.PlaceId),
+        PlaceVersion = tostring(game.PlaceVersion),
+        Players = tostring(#Players:GetPlayers()),
+        ClientContext = RunService:IsStudio() and "Roblox Studio client" or "Roblox client",
+        Executor = "Not exposed by official Roblox APIs",
+        DeviceModel = "Not exposed to LocalScripts",
+        Hardware = "Not exposed to LocalScripts",
+    }
+    for key, valueLabel in pairs(deviceInfoValues) do
+        valueLabel.Text = info[key] or "Unavailable"
+    end
+    deviceSummaryLabel.Text = preferred .. "  ·  " .. orientation .. "  ·  " .. tostring(math.floor(viewport.X)) .. "×" .. tostring(math.floor(viewport.Y))
+    if not quiet then toast("Device information refreshed") end
+end
+addAction(devicePage, "Refresh device info", "REFRESH", function() refreshDeviceInfo(false) end)
+refreshDeviceInfo(true)
+-- Restore saved configuration when the UI is recreated in the same client session.
+task.defer(function()
+    if state.closed then return end
+    local autoName = presetStorage:GetAttribute("AutoLoadPreset")
+    if typeof(autoName) == "string" and autoName ~= "" and loadPreset then loadPreset(autoName) end
+    if player.Team then
+        local teamLink = teamPresetFolder:FindFirstChild(player.Team.Name)
+        if teamLink and teamLink:IsA("StringValue") and loadPreset then loadPreset(teamLink.Value) end
+    end
+end)
+-- Keep visible viewport/input details fresh when orientation, camera, or preferred input changes.
+local deviceViewportConnection
+local function bindDeviceViewport()
+    if deviceViewportConnection then deviceViewportConnection:Disconnect(); deviceViewportConnection = nil end
+    local currentCamera = workspace.CurrentCamera
+    if currentCamera then
+        deviceViewportConnection = currentCamera:GetPropertyChangedSignal("ViewportSize"):Connect(function()
+            refreshDeviceInfo(true)
+        end)
+    end
+end
+bindDeviceViewport()
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    bindDeviceViewport()
+    refreshDeviceInfo(true)
+end)
+UserInputService:GetPropertyChangedSignal("PreferredInput"):Connect(function()
+    refreshDeviceInfo(true)
+end)
+
+-- Page startup. All category panels stay in the deck; the marker shows keyboard/touch focus.
+pages.Overview.Visible = true
+for name, button in pairs(navButtons) do
+    local active = name == state.page
+    button.BackgroundColor3 = active and Theme.secondary or Theme.card
+    button.TextColor3 = active and Theme.text or Theme.muted
+    local edge = button:FindFirstChildOfClass("UIStroke")
+    if edge then edge.Color = active and Theme.text or Theme.border end
+    local navLabel = button:FindFirstChild("SectionName")
+    if navLabel then navLabel.TextColor3 = active and Theme.text or Theme.muted end
+    local marker = button:FindFirstChild("ActiveMarker")
+    if marker then marker.BackgroundTransparency = active and 0 or 1 end
+    if navIconUpdaters[name] then navIconUpdaters[name](active and Theme.text or Theme.muted) end
+end
+
+-- Center the selected category
+-- Center the selected category in the horizontal dock.
+centerNavItem = function(name, immediate)
+    local nav = navButtons[name]
+    if not nav or not nav.Parent or not sidebar.Parent then return end
+    task.defer(function()
+        if not nav.Parent or not sidebar.Parent then return end
+        local currentX = sidebar.CanvasPosition.X
+        local viewportCenter = sidebar.AbsolutePosition.X + sidebar.AbsoluteSize.X / 2
+        local itemCenter = nav.AbsolutePosition.X + nav.AbsoluteSize.X / 2
+        local targetX = currentX + itemCenter - viewportCenter
+        local maxX = math.max(0, sidebar.AbsoluteCanvasSize.X - sidebar.AbsoluteSize.X)
+        targetX = math.clamp(targetX, 0, maxX)
+        local target = Vector2.new(targetX, 0)
+        state.navProgrammatic = true
+        if immediate or state.reduceMotion then
+            sidebar.CanvasPosition = target
+            task.delay(0.06, function() state.navProgrammatic = false end)
+        else
+            local tween = animate(sidebar, 0.22, {CanvasPosition = target}, Enum.EasingStyle.Quint)
+            if tween then tween.Completed:Connect(function() state.navProgrammatic = false end)
+            else sidebar.CanvasPosition = target; state.navProgrammatic = false end
+            task.delay(0.32, function() state.navProgrammatic = false end)
+        end
+    end)
+end
+
+-- Swiping the deck snaps to the nearest category; selection and dock state stay synchronized.
+local deckScrollTicket = 0
+pageHolder:GetPropertyChangedSignal("CanvasPosition"):Connect(function()
+    if state.deckProgrammatic or state.sliderDragging or not pageHolder.Parent then return end
+    deckScrollTicket += 1
+    local ticket = deckScrollTicket
+    task.delay(0.18, function()
+        if ticket ~= deckScrollTicket or state.deckProgrammatic or state.sliderDragging or not pageHolder.Parent then return end
+        local viewportCenter = pageHolder.AbsolutePosition.X + pageHolder.AbsoluteSize.X / 2
+        local nearestName, nearestDistance
+        for name, page in pairs(pages) do
+            if page.Parent then
+                local centerX = page.AbsolutePosition.X + page.AbsoluteSize.X / 2
+                local distance = math.abs(centerX - viewportCenter)
+                if nearestDistance == nil or distance < nearestDistance then
+                    nearestName, nearestDistance = name, distance
+                end
+            end
+        end
+        if nearestName then setPage(nearestName, true) end
+    end)
+end)
+
+-- Responsive sizing uses the live viewport; portrait phones get a tall, narrow panel.
+applyHeaderSizing = function(width)
+    brandTitle.TextSize = width < 390 and 14 or 16
+    brandSubtitle.TextSize = width < 360 and 8 or 9
+    local available = math.max(68, width - 180)
+    brandTitle.Size = UDim2.new(0, available, 0, 22)
+    brandSubtitle.Size = UDim2.new(0, available, 0, 13)
+end
+
+updateResponsiveSize = function()
+    camera = workspace.CurrentCamera
+    if not camera then return end
+    local viewport = camera.ViewportSize
+    local maxW = math.max(160, math.min(860, viewport.X - 18))
+    local maxH = math.max(160, math.min(600, viewport.Y - 22))
+    local width, height
+    if state.userResized and state.windowSize then
+        width = math.clamp(state.windowSize.X.Offset, math.min(285, maxW), maxW)
+        height = math.clamp(state.windowSize.Y.Offset, math.min(270, maxH), maxH)
+    else
+        width = math.clamp(viewport.X * (viewport.X < 700 and 0.90 or 0.70), math.min(285, maxW), maxW)
+        height = math.clamp(viewport.Y * 0.78, math.min(270, maxH), maxH)
+    end
+    main.Size = UDim2.fromOffset(width, height)
+    state.windowSize = main.Size
+    local bodyWidth = math.max(120, width - 20)
+    sidebarPanel.Size = UDim2.new(1, 0, 0, 42)
+    sidebar.Size = UDim2.new(1, -8, 1, -6)
+    pageHolder.Position = UDim2.new(0, 0, 0, 49)
+    pageHolder.Size = UDim2.new(1, 0, 1, -49)
+    local columnWidth
+    if bodyWidth < 500 then columnWidth = bodyWidth
+    else columnWidth = math.clamp(math.floor((bodyWidth - 18) / 2.8), 200, 245) end
+    for _, page in pairs(pages) do page.Size = UDim2.new(0, columnWidth, 1, 0) end
+    if profileCard and profileCard.Parent then
+        profileCard.Size = UDim2.new(1, 0, 0, 126)
+        profileDetails.Position = UDim2.new(0, 6, 0, 70)
+        profileDetails.Size = UDim2.new(1, -12, 0, 50)
+    end
+    applyHeaderSizing(width)
+    task.defer(refreshNavCanvas)
+    task.defer(refreshDeckCanvas)
+end
+updateResponsiveSize()
+if camera then camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveSize) end
+workspace:GetPropertyChangedSignal("CurrentCamera"):Connect(function()
+    camera = workspace.CurrentCamera
+    if camera then camera:GetPropertyChangedSignal("ViewportSize"):Connect(updateResponsiveSize); updateResponsiveSize() end
+end)
+
+-- Drag support for mouse and touch.
+local function makeDraggable(handle, target)
+    local dragging = false
+    local dragStart, startPosition, dragInput
+    local function beginsOnHeaderAction(point)
+        if handle ~= header then return false end
+        for _, control in ipairs({closeButton, minimizeButton, resizeButton}) do
+            local pos, size = control.AbsolutePosition, control.AbsoluteSize
+            if point.X >= pos.X and point.X <= pos.X + size.X and point.Y >= pos.Y and point.Y <= pos.Y + size.Y then
+                return true
+            end
+        end
+        return false
+    end
+    handle.InputBegan:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+            if beginsOnHeaderAction(input.Position) then return end
+            if state.resizing then return end
+            dragging = true
+            dragStart = input.Position
+            startPosition = target.Position
+            dragInput = input
+            input.Changed:Connect(function()
+                if input.UserInputState == Enum.UserInputState.End then dragging = false end
+            end)
+        end
+    end)
+    handle.InputChanged:Connect(function(input)
+        if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then dragInput = input end
+    end)
+    UserInputService.InputChanged:Connect(function(input)
+        if dragging and not state.resizing and (input == dragInput or input.UserInputType == Enum.UserInputType.Touch) and dragStart and startPosition then
+            local delta = input.Position - dragStart
+            target.Position = UDim2.new(
+                startPosition.X.Scale, startPosition.X.Offset + delta.X,
+                startPosition.Y.Scale, startPosition.Y.Offset + delta.Y
+            )
+        end
+    end)
+end
+makeDraggable(header, main)
+
+-- The minimized orb can be repositioned, but only a tap restores the main window.
+-- Handle the tap ourselves instead of relying on GuiButton.Activated after a drag gesture.
+local restoreMinimized
+local orbPressActive = false
+local orbPressTouch = false
+local orbPressStart = nil
+local orbStartCenter = nil
+local orbMoved = false
+orb.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        orbPressActive = true
+        orbPressTouch = input.UserInputType == Enum.UserInputType.Touch
+        orbPressStart = input.Position
+        orbStartCenter = orb.AbsolutePosition + (orb.AbsoluteSize / 2)
+        orbMoved = false
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not orbPressActive or not orbPressStart or not orbStartCenter then return end
+    local matchingMovement = (orbPressTouch and input.UserInputType == Enum.UserInputType.Touch)
+        or (not orbPressTouch and input.UserInputType == Enum.UserInputType.MouseMovement)
+    if not matchingMovement then return end
+    local delta = input.Position - orbPressStart
+    if not orbMoved and delta.Magnitude >= 6 then orbMoved = true end
+    if orbMoved then
+        local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+        local halfW, halfH = orb.AbsoluteSize.X / 2, orb.AbsoluteSize.Y / 2
+        local centerX = math.clamp(orbStartCenter.X + delta.X, halfW, math.max(halfW, viewport.X - halfW))
+        local centerY = math.clamp(orbStartCenter.Y + delta.Y, halfH, math.max(halfH, viewport.Y - halfH))
+        orb.Position = UDim2.fromOffset(centerX, centerY)
+    end
+end)
+UserInputService.InputEnded:Connect(function(input)
+    local isPointerRelease = (orbPressTouch and input.UserInputType == Enum.UserInputType.Touch)
+        or (not orbPressTouch and input.UserInputType == Enum.UserInputType.MouseButton1)
+    if not orbPressActive or not isPointerRelease then return end
+    local wasMoved = orbMoved
+    orbPressActive = false
+    if wasMoved then
+        -- A drag ends silently; it never invokes the restore path.
+    else
+        local point = input.Position
+        local pos, size = orb.AbsolutePosition, orb.AbsoluteSize
+        local releasedOnOrb = point.X >= pos.X and point.X <= pos.X + size.X
+            and point.Y >= pos.Y and point.Y <= pos.Y + size.Y
+        if releasedOnOrb then
+            task.defer(function()
+                if state.minimized and not state.closed and restoreMinimized then restoreMinimized() end
+            end)
+        end
+    end
+end)
+
+-- Resize from the top-bar control. The shared flag prevents the header drag handler from moving the window.
+local resizing = false
+local resizeStartPointer
+local resizeStartSize
+local resizeStartPosition
+local resizeDragInput
+resizeButton.InputBegan:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = true
+        state.resizing = true
+        resizeStartPointer = input.Position
+        resizeStartSize = main.AbsoluteSize
+        resizeStartPosition = main.Position
+        resizeDragInput = input
+        state.userResized = true
+        input.Changed:Connect(function()
+            if input.UserInputState == Enum.UserInputState.End then
+                resizing = false
+                state.resizing = false
+            end
+        end)
+    end
+end)
+resizeButton.InputChanged:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseMovement or input.UserInputType == Enum.UserInputType.Touch then
+        resizeDragInput = input
+    end
+end)
+UserInputService.InputChanged:Connect(function(input)
+    if not resizing or not resizeStartPointer or not resizeStartSize then return end
+    if input ~= resizeDragInput and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    if input.UserInputType ~= Enum.UserInputType.MouseMovement and input.UserInputType ~= Enum.UserInputType.Touch then return end
+    local delta = input.Position - resizeStartPointer
+    local viewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(900, 700)
+    local maxW = math.max(160, math.min(860, viewport.X - 18))
+    local maxH = math.max(160, math.min(600, viewport.Y - 22))
+    local newW = math.clamp(resizeStartSize.X + delta.X, math.min(285, maxW), maxW)
+    local newH = math.clamp(resizeStartSize.Y + delta.Y, math.min(270, maxH), maxH)
+    main.Size = UDim2.fromOffset(newW, newH)
+    -- Keep the left/top edges stable while the center-anchored window grows.
+    main.Position = UDim2.new(
+        resizeStartPosition.X.Scale, resizeStartPosition.X.Offset + (newW - resizeStartSize.X) / 2,
+        resizeStartPosition.Y.Scale, resizeStartPosition.Y.Offset + (newH - resizeStartSize.Y) / 2
+    )
+    state.windowSize = main.Size
+    -- Recompute the left rail and content width as the window is resized, not only on viewport changes.
+    updateResponsiveSize()
+end)
+UserInputService.InputEnded:Connect(function(input)
+    if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.Touch then
+        resizing = false
+        state.resizing = false
+    end
+end)
+
+local function minimize()
+    if state.minimized or state.closed then return end
+    state.windowSize = main.Size
+    state.minimized = true
+    if glassBlurEffect then glassBlurEffect.Enabled = false end
+    -- Hide the page deck and header before shrinking the unclipped window; otherwise
+    -- horizontally adjacent ScrollingFrame pages can escape the tiny frame for a flash.
+    header.Visible = false
+    body.Visible = false
+    animate(main, state.reduceMotion and 0.05 or 0.20, {
+        Size = UDim2.fromOffset(12, 12),
+        BackgroundTransparency = 1,
+        Rotation = state.reduceMotion and 0 or -5,
+    }, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+    task.delay(state.reduceMotion and 0.06 or 0.19, function()
+        if main.Parent then main.Visible = false end
+        orb.Visible = true
+        orb.BackgroundTransparency = 1
+        orb.Size = UDim2.fromOffset(10, 10)
+        animate(orb, state.reduceMotion and 0.10 or 0.24, {BackgroundTransparency = 0, Size = UDim2.fromOffset(28, 28)}, Enum.EasingStyle.Back)
+    end)
+end
+restoreMinimized = function()
+    if state.closed then return end
+    state.minimized = false
+    orb.Visible = false
+    main.Visible = true
+    -- Keep content hidden throughout the restore bounce; reveal it only once full size is reached.
+    header.Visible = false
+    body.Visible = false
+    local oldSize = state.windowSize or UDim2.fromOffset(660, 480)
+    main.Size = UDim2.fromOffset(16, 16)
+    main.BackgroundTransparency = 1
+    main.Rotation = state.reduceMotion and 0 or 4
+    local restoreTween = animate(main, state.reduceMotion and 0.05 or 0.24, {Size = oldSize, BackgroundTransparency = 0, Rotation = 0}, Enum.EasingStyle.Back)
+    local function finishRestore()
+        if main.Parent and not state.closed then
+            header.Visible = true
+            body.Visible = true
+            applyGlass(state.glass, values.GlassBlur or 42)
+        end
+    end
+    if restoreTween then
+        restoreTween.Completed:Connect(finishRestore)
+    else
+        finishRestore()
+    end
+end
+minimizeButton.Activated:Connect(minimize)
+closeButton.Activated:Connect(function()
+    state.closed = true
+    animate(main, 0.14, {BackgroundTransparency = 1, Rotation = 4, Size = UDim2.fromOffset(8, 8)}, Enum.EasingStyle.Back, Enum.EasingDirection.In)
+    task.delay(0.16, function()
+        if glassBlurEffect then glassBlurEffect:Destroy(); glassBlurEffect = nil end
+        if gui.Parent then gui:Destroy() end
+    end)
+end)
+
+-- Subtle looping rotation / lighting effects. RGB only updates registered accent channels.
+local rgbAccumulator = 0
+local orbitAngle = 0
+local heartbeatConnection
+heartbeatConnection = RunService.Heartbeat:Connect(function(dt)
+    if state.closed or not gui.Parent then
+        if heartbeatConnection then heartbeatConnection:Disconnect() end
+        return
+    end
+    if not state.reduceMotion then
+        orbitAngle = (orbitAngle + dt * 24) % 360
+        orbOrbit.Rotation = -orbitAngle * 0.72
+        orbGradient.Rotation = (orbGradient.Rotation + dt * 15) % 360
+        local pulse = 1 + math.sin(os.clock() * 2.4) * 0.035
+        orbMarkScale.Scale = state.minimized and pulse or 1
+        emblemMarkScale.Scale = (not state.minimized and main.Parent) and pulse or 1
+        if not state.minimized and main.Parent then
+            orbit.Rotation = orbitAngle
+            emblemGradient.Rotation = (emblemGradient.Rotation + dt * 18) % 360
+        end
+    else
+        emblemMarkScale.Scale = 1
+        orbMarkScale.Scale = 1
+    end
+    if state.rgb then
+        rgbAccumulator += dt
+        if rgbAccumulator >= 0.033 then
+            local step = math.min(rgbAccumulator, 0.05)
+            rgbAccumulator = 0
+            state.hue = (state.hue + step * 0.105) % 1
+            applyAccent(Color3.fromHSV(state.hue, 0.72, 1))
+        end
+    end
+end)
+
+-- Bottom-right welcome notification using the same DD monogram as the main/minimized logo.
+local startupViewport = workspace.CurrentCamera and workspace.CurrentCamera.ViewportSize or Vector2.new(800, 600)
+local startupNoticeWidth = math.max(160, math.min(292, startupViewport.X - 24))
+local startupMessageSize = startupNoticeWidth < 205 and 8 or 9
+local startupNotice = create("Frame", {
+    Name = "ScriptEngineStartupNotice",
+    AnchorPoint = Vector2.new(1, 1),
+    Position = UDim2.new(1, 330, 1, -86),
+    Size = UDim2.fromOffset(startupNoticeWidth, 100),
+    BackgroundColor3 = Theme.panel,
+    BackgroundTransparency = 0,
+    BorderSizePixel = 0,
+    ZIndex = 200,
+}, gui)
+corner(startupNotice, 13)
+local startupEdge = stroke(startupNotice, Theme.accent, 1.3, 0.12)
+bindAccent(function(color) if startupEdge.Parent then startupEdge.Color = color; return true end return false end)
+local startupLogo = create("Frame", {
+    Position = UDim2.fromOffset(12, 14), Size = UDim2.fromOffset(42, 42),
+    BackgroundColor3 = Theme.text, BorderSizePixel = 0, ZIndex = 202,
+}, startupNotice)
+corner(startupLogo, 100)
+local startupLogoGradient = create("UIGradient", {
+    Rotation = 30, Color = ColorSequence.new(Theme.text, Color3.fromRGB(190, 190, 190)),
+}, startupLogo)
+bindAccent(function(color) if startupLogoGradient.Parent then startupLogoGradient.Color = ColorSequence.new(Color3.new(1,1,1), color); return true end return false end)
+local startupLogoRing = create("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5,0.5),
+    Size = UDim2.new(1, 8, 1, 8), BackgroundTransparency = 1, ZIndex = 201,
+}, startupLogo)
+corner(startupLogoRing, 100)
+local startupRingStroke = stroke(startupLogoRing, Theme.accent, 1, 0.15)
+bindAccent(function(color) if startupRingStroke.Parent then startupRingStroke.Color = color; return true end return false end)
+local startupMark = makeDDMark(startupLogo, 42, 203, false)
+create("TextLabel", {
+    Position = UDim2.fromOffset(65, 12), Size = UDim2.new(1, -77, 0, 19),
+    BackgroundTransparency = 1, Text = "SCRIPTENGINE  /  v" .. BUILD_NUMBER,
+    TextColor3 = Theme.text, Font = Enum.Font.GothamBlack, TextSize = 10,
+    TextXAlignment = Enum.TextXAlignment.Left, TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 202,
+}, startupNotice)
+create("TextLabel", {
+    Position = UDim2.fromOffset(65, 33), Size = UDim2.new(1, -77, 0, 48),
+    BackgroundTransparency = 1, Text = "This version of ScriptEngine is currently keyless. Enjoy scripting without leaving the game!",
+    TextColor3 = Theme.muted, Font = Enum.Font.GothamMedium, TextSize = startupMessageSize,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, ZIndex = 202,
+}, startupNotice)
+local startupAccent = create("Frame", {
+    Position = UDim2.fromOffset(65, 85), Size = UDim2.new(0.28, 0, 0, 2),
+    BackgroundColor3 = Theme.accent, BorderSizePixel = 0, ZIndex = 203,
+}, startupNotice)
+corner(startupAccent, 2)
+bindAccent(function(color) if startupAccent.Parent then startupAccent.BackgroundColor3 = color; return true end return false end)
+if not state.reduceMotion then
+    animate(startupNotice, 0.34, {Position = UDim2.new(1, -18, 1, -86)}, Enum.EasingStyle.Back)
+else
+    startupNotice.Position = UDim2.new(1, -18, 1, -86)
+end
+task.delay(6.6, function()
+    if startupNotice.Parent then
+        if state.reduceMotion then startupNotice:Destroy()
+        else
+            animate(startupNotice, 0.22, {Position = UDim2.new(1, 330, 1, -86), BackgroundTransparency = 1}, Enum.EasingStyle.Quad, Enum.EasingDirection.In)
+            task.delay(0.24, function() if startupNotice.Parent then startupNotice:Destroy() end end)
+        end
+    end
+end)
